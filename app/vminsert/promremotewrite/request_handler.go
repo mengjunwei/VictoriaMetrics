@@ -1,6 +1,7 @@
 package promremotewrite
 
 import (
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/netstorage"
@@ -39,8 +40,14 @@ func insertRows(at *auth.Token, timeseries []prompb.TimeSeries) error {
 		ts := &timeseries[i]
 		ctx.Labels = ctx.Labels[:0]
 		srcLabels := ts.Labels
+		tmpLabelMap := make(map[string]string, len(srcLabels))
 		for _, srcLabel := range srcLabels {
-			ctx.AddLabelBytes(srcLabel.Name, srcLabel.Value)
+			if len(srcLabel.Value) > 0 {
+				tmpLabelMap[bytesutil.ToUnsafeString(srcLabel.Name)] = bytesutil.ToUnsafeString(srcLabel.Value)
+			}
+		}
+		for k, v := range tmpLabelMap {
+			ctx.AddLabel(k, v)
 		}
 		if hasRelabeling {
 			ctx.ApplyRelabeling()
