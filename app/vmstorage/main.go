@@ -22,12 +22,13 @@ import (
 )
 
 var (
-	httpListenAddr  = flag.String("httpListenAddr", ":8482", "Address to listen for http connections")
-	retentionPeriod = flag.Int("retentionPeriod", 1, "Retention period in months")
-	storageDataPath = flag.String("storageDataPath", "vmstorage-data", "Path to storage data")
-	vminsertAddr    = flag.String("vminsertAddr", ":8400", "TCP address to accept connections from vminsert services")
-	vmselectAddr    = flag.String("vmselectAddr", ":8401", "TCP address to accept connections from vmselect services")
-	snapshotAuthKey = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
+	httpListenAddr    = flag.String("httpListenAddr", ":8482", "Address to listen for http connections")
+	retentionPeriod   = flag.Int("retentionPeriod", 1, "Retention period in months")
+	storageDataPath   = flag.String("storageDataPath", "vmstorage-data", "Path to storage data")
+	vminsertAddr      = flag.String("vminsertAddr", ":8400", "TCP address to accept connections from vminsert services")
+	vmselectAddr      = flag.String("vmselectAddr", ":8401", "TCP address to accept connections from vmselect services")
+	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
+	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
 
 	bigMergeConcurrency   = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
 	smallMergeConcurrency = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
@@ -67,6 +68,7 @@ func main() {
 
 	registerStorageMetrics(strg)
 
+	transport.StartUnmarshalWorkers()
 	srv, err := transport.NewServer(*vminsertAddr, *vmselectAddr, strg)
 	if err != nil {
 		logger.Fatalf("cannot create a server with vminsertAddr=%s, vmselectAddr=%s: %s", *vminsertAddr, *vmselectAddr, err)
@@ -93,6 +95,7 @@ func main() {
 	logger.Infof("gracefully shutting down the service")
 	startTime = time.Now()
 	srv.MustClose()
+	transport.StopUnmarshalWorkers()
 	logger.Infof("successfully shut down the service in %.3f seconds", time.Since(startTime).Seconds())
 
 	logger.Infof("gracefully closing the storage at %s", *storageDataPath)
@@ -113,6 +116,27 @@ func newRequestHandler(strg *storage.Storage) httpserver.RequestHandler {
 
 func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storage) bool {
 	path := r.URL.Path
+	if path == "/internal/force_merge" {
+		authKey := r.FormValue("authKey")
+		if authKey != *forceMergeAuthKey {
+			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceMergeAuthKey command line flag", authKey)
+			return true
+		}
+		// Run force merge in background
+		partitionNamePrefix := r.FormValue("partition_prefix")
+		go func() {
+			activeForceMerges.Inc()
+			defer activeForceMerges.Dec()
+			logger.Infof("forced merge for partition_prefix=%q has been started", partitionNamePrefix)
+			startTime := time.Now()
+			if err := strg.ForceMergePartitions(partitionNamePrefix); err != nil {
+				logger.Errorf("error in forced merge for partition_prefix=%q: %s", partitionNamePrefix, err)
+				return
+			}
+			logger.Infof("forced merge for partition_prefix=%q has been successfully finished in %.3f seconds", partitionNamePrefix, time.Since(startTime).Seconds())
+		}()
+		return true
+	}
 	if !strings.HasPrefix(path, "/snapshot") {
 		return false
 	}
@@ -182,6 +206,8 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 		return false
 	}
 }
+
+var activeForceMerges = metrics.NewCounter("vm_active_force_merges")
 
 func registerStorageMetrics(strg *storage.Storage) {
 	mCache := &storage.Metrics{}
@@ -298,6 +324,14 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(idbm().AssistedMerges)
 	})
 
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/686
+	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/small"}`, func() float64 {
+		return float64(tm().SmallMergeNeedFreeDiskSpace)
+	})
+	metrics.NewGauge(`vm_merge_need_free_disk_space{type="storage/big"}`, func() float64 {
+		return float64(tm().BigMergeNeedFreeDiskSpace)
+	})
+
 	metrics.NewGauge(`vm_pending_rows{type="storage"}`, func() float64 {
 		return float64(tm().PendingRows)
 	})
@@ -387,6 +421,13 @@ func registerStorageMetrics(strg *storage.Storage) {
 	})
 	metrics.NewGauge(`vm_slow_metric_name_loads_total`, func() float64 {
 		return float64(m().SlowMetricNameLoads)
+	})
+
+	metrics.NewGauge(`vm_timestamps_blocks_merged_total`, func() float64 {
+		return float64(m().TimestampsBlocksMerged)
+	})
+	metrics.NewGauge(`vm_timestamps_bytes_saved_total`, func() float64 {
+		return float64(m().TimestampsBytesSaved)
 	})
 
 	metrics.NewGauge(`vm_rows{type="storage/big"}`, func() float64 {

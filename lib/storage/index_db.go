@@ -923,6 +923,153 @@ func (is *indexSearch) searchTagValues(tvs map[string]struct{}, tagKey []byte, m
 	return nil
 }
 
+// SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.
+//
+// This allows implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find or similar APIs.
+func (db *indexDB) SearchTagValueSuffixes(accountID, projectID uint32, tr TimeRange, tagKey, tagValuePrefix []byte,
+	delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+	// TODO: cache results?
+
+	tvss := make(map[string]struct{})
+	is := db.getIndexSearch(accountID, projectID, deadline)
+	err := is.searchTagValueSuffixesForTimeRange(tvss, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes)
+	db.putIndexSearch(is)
+	if err != nil {
+		return nil, err
+	}
+	ok := db.doExtDB(func(extDB *indexDB) {
+		is := extDB.getIndexSearch(accountID, projectID, deadline)
+		err = is.searchTagValueSuffixesForTimeRange(tvss, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes)
+		extDB.putIndexSearch(is)
+	})
+	if ok && err != nil {
+		return nil, err
+	}
+
+	suffixes := make([]string, 0, len(tvss))
+	for suffix := range tvss {
+		// Do not skip empty suffixes, since they may represent leaf tag values.
+		suffixes = append(suffixes, suffix)
+	}
+	// Do not sort suffixes, since they must be sorted by vmselect.
+	return suffixes, nil
+}
+
+func (is *indexSearch) searchTagValueSuffixesForTimeRange(tvss map[string]struct{}, tr TimeRange, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int) error {
+	minDate := uint64(tr.MinTimestamp) / msecPerDay
+	maxDate := uint64(tr.MaxTimestamp) / msecPerDay
+	if maxDate-minDate > maxDaysForDateMetricIDs {
+		return is.searchTagValueSuffixesAll(tvss, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes)
+	}
+	// Query over multiple days in parallel.
+	var wg sync.WaitGroup
+	var errGlobal error
+	var mu sync.Mutex // protects tvss + errGlobal from concurrent access below.
+	for minDate <= maxDate {
+		wg.Add(1)
+		go func(date uint64) {
+			defer wg.Done()
+			tvssLocal := make(map[string]struct{})
+			isLocal := is.db.getIndexSearch(is.accountID, is.projectID, is.deadline)
+			defer is.db.putIndexSearch(isLocal)
+			err := isLocal.searchTagValueSuffixesForDate(tvssLocal, date, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes)
+			mu.Lock()
+			defer mu.Unlock()
+			if errGlobal != nil {
+				return
+			}
+			if err != nil {
+				errGlobal = err
+				return
+			}
+			for k := range tvssLocal {
+				tvss[k] = struct{}{}
+			}
+		}(minDate)
+		minDate++
+	}
+	wg.Wait()
+	return errGlobal
+}
+
+func (is *indexSearch) searchTagValueSuffixesAll(tvss map[string]struct{}, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int) error {
+	kb := &is.kb
+	nsPrefix := byte(nsPrefixTagToMetricIDs)
+	kb.B = is.marshalCommonPrefix(kb.B[:0], nsPrefix)
+	kb.B = marshalTagValue(kb.B, tagKey)
+	kb.B = marshalTagValue(kb.B, tagValuePrefix)
+	kb.B = kb.B[:len(kb.B)-1] // remove tagSeparatorChar from the end of kb.B
+	prefix := append([]byte(nil), kb.B...)
+	return is.searchTagValueSuffixesForPrefix(tvss, nsPrefix, prefix, tagValuePrefix, delimiter, maxTagValueSuffixes)
+}
+
+func (is *indexSearch) searchTagValueSuffixesForDate(tvss map[string]struct{}, date uint64, tagKey, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int) error {
+	nsPrefix := byte(nsPrefixDateTagToMetricIDs)
+	kb := &is.kb
+	kb.B = is.marshalCommonPrefix(kb.B[:0], nsPrefix)
+	kb.B = encoding.MarshalUint64(kb.B, date)
+	kb.B = marshalTagValue(kb.B, tagKey)
+	kb.B = marshalTagValue(kb.B, tagValuePrefix)
+	kb.B = kb.B[:len(kb.B)-1] // remove tagSeparatorChar from the end of kb.B
+	prefix := append([]byte(nil), kb.B...)
+	return is.searchTagValueSuffixesForPrefix(tvss, nsPrefix, prefix, tagValuePrefix, delimiter, maxTagValueSuffixes)
+}
+
+func (is *indexSearch) searchTagValueSuffixesForPrefix(tvss map[string]struct{}, nsPrefix byte, prefix, tagValuePrefix []byte, delimiter byte, maxTagValueSuffixes int) error {
+	kb := &is.kb
+	ts := &is.ts
+	mp := &is.mp
+	mp.Reset()
+	dmis := is.db.getDeletedMetricIDs()
+	loopsPaceLimiter := 0
+	ts.Seek(prefix)
+	for len(tvss) < maxTagValueSuffixes && ts.NextItem() {
+		if loopsPaceLimiter&paceLimiterFastIterationsMask == 0 {
+			if err := checkSearchDeadlineAndPace(is.deadline); err != nil {
+				return err
+			}
+		}
+		loopsPaceLimiter++
+		item := ts.Item
+		if !bytes.HasPrefix(item, prefix) {
+			break
+		}
+		if err := mp.Init(item, nsPrefix); err != nil {
+			return err
+		}
+		if mp.IsDeletedTag(dmis) {
+			continue
+		}
+		tagValue := mp.Tag.Value
+		if !bytes.HasPrefix(tagValue, tagValuePrefix) {
+			continue
+		}
+		suffix := tagValue[len(tagValuePrefix):]
+		n := bytes.IndexByte(suffix, delimiter)
+		if n < 0 {
+			// Found leaf tag value that doesn't have delimiters after the given tagValuePrefix.
+			tvss[string(suffix)] = struct{}{}
+			continue
+		}
+		// Found non-leaf tag value. Extract suffix that end with the given delimiter.
+		suffix = suffix[:n+1]
+		tvss[string(suffix)] = struct{}{}
+		if suffix[len(suffix)-1] == 255 {
+			continue
+		}
+		// Search for the next suffix
+		suffix[len(suffix)-1]++
+		kb.B = append(kb.B[:0], prefix...)
+		kb.B = marshalTagValue(kb.B, suffix)
+		kb.B = kb.B[:len(kb.B)-1] // remove tagSeparatorChar
+		ts.Seek(kb.B)
+	}
+	if err := ts.Error(); err != nil {
+		return fmt.Errorf("error when searching for tag value sufixes for prefix %q: %w", prefix, err)
+	}
+	return nil
+}
+
 // GetSeriesCount returns the approximate number of unique timeseries for the given (accountID, projectID).
 //
 // It includes the deleted series too and may count the same series
@@ -1815,7 +1962,7 @@ func (is *indexSearch) getTagFilterWithMinMetricIDsCount(tfs *TagFilters, maxMet
 			continue
 		}
 
-		metricIDs, err := is.getMetricIDsForTagFilter(tf, maxMetrics)
+		metricIDs, err := is.getMetricIDsForTagFilter(tf, nil, maxMetrics)
 		if err != nil {
 			if err == errFallbackToMetricNameMatch {
 				// Skip tag filters requiring to scan for too many metrics.
@@ -2078,7 +2225,7 @@ const (
 
 var uselessTagFilterCacheValue = []byte("1")
 
-func (is *indexSearch) getMetricIDsForTagFilter(tf *tagFilter, maxMetrics int) (*uint64set.Set, error) {
+func (is *indexSearch) getMetricIDsForTagFilter(tf *tagFilter, filter *uint64set.Set, maxMetrics int) (*uint64set.Set, error) {
 	if tf.isNegative {
 		logger.Panicf("BUG: isNegative must be false")
 	}
@@ -2096,11 +2243,7 @@ func (is *indexSearch) getMetricIDsForTagFilter(tf *tagFilter, maxMetrics int) (
 
 	// Slow path - scan for all the rows with the given prefix.
 	maxLoops := maxMetrics * maxIndexScanSlowLoopsPerMetric
-	err := is.getMetricIDsForTagFilterSlow(tf, maxLoops, func(metricID uint64) bool {
-		metricIDs.Add(metricID)
-		return metricIDs.Len() < maxMetrics
-	})
-	if err != nil {
+	if err := is.getMetricIDsForTagFilterSlow(tf, filter, maxLoops, metricIDs.Add); err != nil {
 		if err == errFallbackToMetricNameMatch {
 			return nil, err
 		}
@@ -2109,7 +2252,7 @@ func (is *indexSearch) getMetricIDsForTagFilter(tf *tagFilter, maxMetrics int) (
 	return metricIDs, nil
 }
 
-func (is *indexSearch) getMetricIDsForTagFilterSlow(tf *tagFilter, maxLoops int, f func(metricID uint64) bool) error {
+func (is *indexSearch) getMetricIDsForTagFilterSlow(tf *tagFilter, filter *uint64set.Set, maxLoops int, f func(metricID uint64)) error {
 	if len(tf.orSuffixes) > 0 {
 		logger.Panicf("BUG: the getMetricIDsForTagFilterSlow must be called only for empty tf.orSuffixes; got %s", tf.orSuffixes)
 	}
@@ -2146,6 +2289,7 @@ func (is *indexSearch) getMetricIDsForTagFilterSlow(tf *tagFilter, maxLoops int,
 		if err := mp.InitOnlyTail(item, tail); err != nil {
 			return err
 		}
+		mp.ParseMetricIDs()
 		if prevMatch && string(suffix) == string(prevMatchingSuffix) {
 			// Fast path: the same tag value found.
 			// There is no need in checking it again with potentially
@@ -2154,12 +2298,17 @@ func (is *indexSearch) getMetricIDsForTagFilterSlow(tf *tagFilter, maxLoops int,
 			if loops > maxLoops {
 				return errFallbackToMetricNameMatch
 			}
-			mp.ParseMetricIDs()
 			for _, metricID := range mp.MetricIDs {
-				if !f(metricID) {
-					return nil
+				if filter != nil && !filter.Has(metricID) {
+					continue
 				}
+				f(metricID)
 			}
+			continue
+		}
+		if filter != nil && !mp.HasCommonMetricIDs(filter) {
+			// Faster path: there is no need in calling tf.matchSuffix,
+			// since the current row has no matching metricIDs.
 			continue
 		}
 
@@ -2193,11 +2342,11 @@ func (is *indexSearch) getMetricIDsForTagFilterSlow(tf *tagFilter, maxLoops int,
 		if loops > maxLoops {
 			return errFallbackToMetricNameMatch
 		}
-		mp.ParseMetricIDs()
 		for _, metricID := range mp.MetricIDs {
-			if !f(metricID) {
-				return nil
+			if filter != nil && !filter.Has(metricID) {
+				continue
 			}
+			f(metricID)
 		}
 	}
 	if err := ts.Error(); err != nil {
@@ -2537,7 +2686,7 @@ func (is *indexSearch) getMetricIDsForDateAndFilters(date uint64, tfs *TagFilter
 			tfsRemainingWithCount = append(tfsRemainingWithCount, tfsWithCount[i])
 			continue
 		}
-		m, err := is.getMetricIDsForDateTagFilter(tf, date, tfs.commonPrefix, maxDateMetrics)
+		m, err := is.getMetricIDsForDateTagFilter(tf, date, tfs.commonPrefix, nil, maxDateMetrics)
 		if err != nil {
 			return nil, err
 		}
@@ -2588,7 +2737,7 @@ func (is *indexSearch) getMetricIDsForDateAndFilters(date uint64, tfs *TagFilter
 			break
 		}
 		tf := tfWithCount.tf
-		m, err := is.getMetricIDsForDateTagFilter(tf, date, tfs.commonPrefix, maxDateMetrics)
+		m, err := is.getMetricIDsForDateTagFilter(tf, date, tfs.commonPrefix, metricIDs, maxDateMetrics)
 		if err != nil {
 			return nil, err
 		}
@@ -2774,7 +2923,7 @@ func (is *indexSearch) hasDateMetricID(date, metricID uint64) (bool, error) {
 	return true, nil
 }
 
-func (is *indexSearch) getMetricIDsForDateTagFilter(tf *tagFilter, date uint64, commonPrefix []byte, maxMetrics int) (*uint64set.Set, error) {
+func (is *indexSearch) getMetricIDsForDateTagFilter(tf *tagFilter, date uint64, commonPrefix []byte, filter *uint64set.Set, maxMetrics int) (*uint64set.Set, error) {
 	// Augument tag filter prefix for per-date search instead of global search.
 	if !bytes.HasPrefix(tf.prefix, commonPrefix) {
 		logger.Panicf("BUG: unexpected tf.prefix %q; must start with commonPrefix %q", tf.prefix, commonPrefix)
@@ -2788,8 +2937,12 @@ func (is *indexSearch) getMetricIDsForDateTagFilter(tf *tagFilter, date uint64, 
 	tfNew := *tf
 	tfNew.isNegative = false // isNegative for the original tf is handled by the caller.
 	tfNew.prefix = kb.B
-	metricIDs, err := is.getMetricIDsForTagFilter(&tfNew, maxMetrics)
-
+	metricIDs, err := is.getMetricIDsForTagFilter(&tfNew, filter, maxMetrics)
+	if filter != nil {
+		// Do not cache the number of matching metricIDs,
+		// since this number may be modified by filter.
+		return metricIDs, err
+	}
 	// Store the number of matching metricIDs in the cache in order to sort tag filters
 	// in ascending number of matching metricIDs on the next search.
 	is.kb.B = appendDateTagFilterCacheKey(is.kb.B[:0], date, tf, is.accountID, is.projectID)
@@ -2931,16 +3084,13 @@ func (is *indexSearch) intersectMetricIDsWithTagFilterNocache(tf *tagFilter, fil
 
 	// Slow path - scan for all the rows with the given prefix.
 	maxLoops := filter.Len() * maxIndexScanSlowLoopsPerMetric
-	err := is.getMetricIDsForTagFilterSlow(tf, maxLoops, func(metricID uint64) bool {
+	err := is.getMetricIDsForTagFilterSlow(tf, filter, maxLoops, func(metricID uint64) {
 		if tf.isNegative {
 			// filter must be equal to metricIDs
 			metricIDs.Del(metricID)
-			return true
-		}
-		if filter.Has(metricID) {
+		} else {
 			metricIDs.Add(metricID)
 		}
-		return true
 	})
 	if err != nil {
 		if err == errFallbackToMetricNameMatch {
@@ -3129,6 +3279,16 @@ func (mp *tagToMetricIDsRowParser) ParseMetricIDs() {
 		metricIDs[i] = metricID
 		tail = tail[8:]
 	}
+}
+
+// HasCommonMetricIDs returns true if mp has at least one common metric id with filter.
+func (mp *tagToMetricIDsRowParser) HasCommonMetricIDs(filter *uint64set.Set) bool {
+	for _, metricID := range mp.MetricIDs {
+		if filter.Has(metricID) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsDeletedTag verifies whether the tag from mp is deleted according to dmis.

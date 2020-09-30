@@ -355,6 +355,9 @@ type Metrics struct {
 	SlowPerDayIndexInserts uint64
 	SlowMetricNameLoads    uint64
 
+	TimestampsBlocksMerged uint64
+	TimestampsBytesSaved   uint64
+
 	TSIDCacheSize       uint64
 	TSIDCacheSizeBytes  uint64
 	TSIDCacheRequests   uint64
@@ -419,6 +422,9 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 	m.SlowRowInserts += atomic.LoadUint64(&s.slowRowInserts)
 	m.SlowPerDayIndexInserts += atomic.LoadUint64(&s.slowPerDayIndexInserts)
 	m.SlowMetricNameLoads += atomic.LoadUint64(&s.slowMetricNameLoads)
+
+	m.TimestampsBlocksMerged = atomic.LoadUint64(&timestampsBlocksMerged)
+	m.TimestampsBytesSaved = atomic.LoadUint64(&timestampsBytesSaved)
 
 	var cs fastcache.Stats
 	s.tsidCache.UpdateStats(&cs)
@@ -993,6 +999,14 @@ func (s *Storage) SearchTagValues(accountID, projectID uint32, tagKey []byte, ma
 	return s.idb().SearchTagValues(accountID, projectID, tagKey, maxTagValues, deadline)
 }
 
+// SearchTagValueSuffixes returns all the tag value suffixes for the given tagKey and tagValuePrefix on the given tr.
+//
+// This allows implementing https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find or similar APIs.
+func (s *Storage) SearchTagValueSuffixes(accountID, projectID uint32, tr TimeRange, tagKey, tagValuePrefix []byte,
+	delimiter byte, maxTagValueSuffixes int, deadline uint64) ([]string, error) {
+	return s.idb().SearchTagValueSuffixes(accountID, projectID, tr, tagKey, tagValuePrefix, delimiter, maxTagValueSuffixes, deadline)
+}
+
 // SearchTagEntries returns a list of (tagName -> tagValues) for (accountID, projectID).
 func (s *Storage) SearchTagEntries(accountID, projectID uint32, maxTagKeys, maxTagValues int, deadline uint64) ([]TagEntry, error) {
 	idb := s.idb()
@@ -1104,6 +1118,13 @@ func (mr *MetricRow) Unmarshal(src []byte) ([]byte, error) {
 	tail = tail[8:]
 
 	return tail, nil
+}
+
+// ForceMergePartitions force-merges partitions in s with names starting from the given partitionNamePrefix.
+//
+// Partitions are merged sequentially in order to reduce load on the system.
+func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
+	return s.tb.ForceMergePartitions(partitionNamePrefix)
 }
 
 // AddRows adds the given mrs to s.

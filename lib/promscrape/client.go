@@ -7,12 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/fasthttp"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	maxScrapeSize = flag.Int("promscrape.maxScrapeSize", 16*1024*1024, "The maximum size of scrape response in bytes to process from Prometheus targets. "+
+	maxScrapeSize = flagutil.NewBytes("promscrape.maxScrapeSize", 16*1024*1024, "The maximum size of scrape response in bytes to process from Prometheus targets. "+
 		"Bigger responses are rejected")
 	disableCompression = flag.Bool("promscrape.disableCompression", false, "Whether to disable sending 'Accept-Encoding: gzip' request headers to all the scrape targets. "+
 		"This may reduce CPU usage on scrape targets at the cost of higher network bandwidth utilization. "+
@@ -60,7 +61,7 @@ func newClient(sw *ScrapeWork) *client {
 		MaxIdleConnDuration:          2 * sw.ScrapeInterval,
 		ReadTimeout:                  sw.ScrapeTimeout,
 		WriteTimeout:                 10 * time.Second,
-		MaxResponseBodySize:          *maxScrapeSize,
+		MaxResponseBodySize:          maxScrapeSize.N,
 		MaxIdempotentRequestAttempts: 1,
 	}
 	return &client{
@@ -96,7 +97,16 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 		req.Header.Set("Authorization", c.authHeader)
 	}
 	resp := fasthttp.AcquireResponse()
+	swapResponseBodies := len(dst) == 0
+	if swapResponseBodies {
+		// An optimization: write response directly to dst.
+		// This should reduce memory uage when scraping big targets.
+		dst = resp.SwapBody(dst)
+	}
 	err := doRequestWithPossibleRetry(c.hc, req, resp, deadline)
+	if swapResponseBodies {
+		dst = resp.SwapBody(dst)
+	}
 	statusCode := resp.StatusCode()
 	if err == nil && (statusCode == fasthttp.StatusMovedPermanently || statusCode == fasthttp.StatusFound) {
 		// Allow a single redirect.
@@ -117,21 +127,28 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 		}
 		if err == fasthttp.ErrBodyTooLarge {
 			return dst, fmt.Errorf("the response from %q exceeds -promscrape.maxScrapeSize=%d; "+
-				"either reduce the response size for the target or increase -promscrape.maxScrapeSize", c.scrapeURL, *maxScrapeSize)
+				"either reduce the response size for the target or increase -promscrape.maxScrapeSize", c.scrapeURL, maxScrapeSize.N)
 		}
 		return dst, fmt.Errorf("error when scraping %q: %w", c.scrapeURL, err)
 	}
 	dstLen := len(dst)
 	if ce := resp.Header.Peek("Content-Encoding"); string(ce) == "gzip" {
 		var err error
-		dst, err = fasthttp.AppendGunzipBytes(dst, resp.Body())
+		var src []byte
+		if swapResponseBodies {
+			src = append(src, dst...)
+			dst = dst[:0]
+		} else {
+			src = resp.Body()
+		}
+		dst, err = fasthttp.AppendGunzipBytes(dst, src)
 		if err != nil {
 			fasthttp.ReleaseResponse(resp)
 			scrapesGunzipFailed.Inc()
 			return dst, fmt.Errorf("cannot ungzip response from %q: %w", c.scrapeURL, err)
 		}
 		scrapesGunzipped.Inc()
-	} else {
+	} else if !swapResponseBodies {
 		dst = append(dst, resp.Body()...)
 	}
 	if statusCode != fasthttp.StatusOK {

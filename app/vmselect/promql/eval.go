@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -57,14 +58,7 @@ func AdjustStartEnd(start, end, step int64) (int64, int64) {
 
 	// Round start and end to values divisible by step in order
 	// to enable response caching (see EvalConfig.mayCache).
-
-	// Round start to the nearest smaller value divisible by step.
-	start -= start % step
-	// Round end to the nearest bigger value divisible by step.
-	adjust := end % step
-	if adjust > 0 {
-		end += step - adjust
-	}
+	start, end = alignStartEnd(start, end, step)
 
 	// Make sure that the new number of points is the same as the initial number of points.
 	newPoints := (end-start)/step + 1
@@ -73,6 +67,17 @@ func AdjustStartEnd(start, end, step int64) (int64, int64) {
 		newPoints--
 	}
 
+	return start, end
+}
+
+func alignStartEnd(start, end, step int64) (int64, int64) {
+	// Round start to the nearest smaller value divisible by step.
+	start -= start % step
+	// Round end to the nearest bigger value divisible by step.
+	adjust := end % step
+	if adjust > 0 {
+		end += step - adjust
+	}
 	return start, end
 }
 
@@ -86,7 +91,7 @@ type EvalConfig struct {
 	// QuotedRemoteAddr contains quoted remote address.
 	QuotedRemoteAddr string
 
-	Deadline netstorage.Deadline
+	Deadline searchutils.Deadline
 
 	MayCache bool
 
@@ -507,11 +512,13 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 
 	ecSQ := newEvalConfig(ec)
 	ecSQ.Start -= window + maxSilenceInterval + step
+	ecSQ.End += step
 	ecSQ.Step = step
 	if err := ValidateMaxPointsPerTimeseries(ecSQ.Start, ecSQ.End, ecSQ.Step); err != nil {
 		return nil, err
 	}
-	ecSQ.Start, ecSQ.End = AdjustStartEnd(ecSQ.Start, ecSQ.End, ecSQ.Step)
+	// unconditionally align start and end args to step for subquery as Prometheus does.
+	ecSQ.Start, ecSQ.End = alignStartEnd(ecSQ.Start, ecSQ.End, ecSQ.Step)
 	tssSQ, err := evalExpr(ecSQ, re.Expr)
 	if err != nil {
 		return nil, err
@@ -523,7 +530,6 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 		}
 		return nil, nil
 	}
-
 	sharedTimestamps := getTimestamps(ec.Start, ec.End, ec.Step)
 	preFunc, rcs, err := getRollupConfigs(name, rf, expr, ec.Start, ec.End, ec.Step, window, ec.LookbackDelta, sharedTimestamps)
 	if err != nil {
@@ -665,6 +671,7 @@ func evalRollupFuncWithMetricExpr(ec *EvalConfig, name string, rf rollupFunc,
 		return nil, err
 	}
 	if isPartial && ec.DenyPartialResponse {
+		rss.Cancel()
 		return nil, fmt.Errorf("cannot return full response, since some of vmstorage nodes are unavailable")
 	}
 	rssLen := rss.Len()
@@ -748,7 +755,7 @@ func getRollupMemoryLimiter() *memoryLimiter {
 
 func evalRollupWithIncrementalAggregate(name string, iafc *incrementalAggrFuncContext, rss *netstorage.Results, rcs []*rollupConfig,
 	preFunc func(values []float64, timestamps []int64), sharedTimestamps []int64, removeMetricGroup bool) ([]*timeseries, error) {
-	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) {
+	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
 		preFunc(rs.Values, rs.Timestamps)
 		ts := getTimeseries()
 		defer putTimeseries(ts)
@@ -768,6 +775,7 @@ func evalRollupWithIncrementalAggregate(name string, iafc *incrementalAggrFuncCo
 			ts.Timestamps = nil
 			ts.denyReuse = false
 		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -780,7 +788,7 @@ func evalRollupNoIncrementalAggregate(name string, rss *netstorage.Results, rcs 
 	preFunc func(values []float64, timestamps []int64), sharedTimestamps []int64, removeMetricGroup bool) ([]*timeseries, error) {
 	tss := make([]*timeseries, 0, rss.Len()*len(rcs))
 	var tssLock sync.Mutex
-	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) {
+	err := rss.RunParallel(func(rs *netstorage.Result, workerID uint) error {
 		preFunc(rs.Values, rs.Timestamps)
 		for _, rc := range rcs {
 			if tsm := newTimeseriesMap(name, sharedTimestamps, &rs.MetricName); tsm != nil {
@@ -796,6 +804,7 @@ func evalRollupNoIncrementalAggregate(name string, rss *netstorage.Results, rcs 
 			tss = append(tss, &ts)
 			tssLock.Unlock()
 		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -845,7 +854,7 @@ func evalTime(ec *EvalConfig) []*timeseries {
 	timestamps := rv[0].Timestamps
 	values := rv[0].Values
 	for i, ts := range timestamps {
-		values[i] = float64(ts) * 1e-3
+		values[i] = float64(ts) / 1e3
 	}
 	return rv
 }

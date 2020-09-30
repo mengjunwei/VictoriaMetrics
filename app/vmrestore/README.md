@@ -21,7 +21,7 @@ vmrestore -src=gcs://<bucket>/<path/to/backup> -storageDataPath=<local/path/to/r
 * `<local/path/to/restore>` is the path to folder where data will be restored. This folder must be passed
   to VictoriaMetrics in `-storageDataPath` command-line flag after the restore process is complete.
 
-The original `-storageDataPath` directory may contain old files. They will be susbstituted by the files from backup,
+The original `-storageDataPath` directory may contain old files. They will be substituted by the files from backup,
 i.e. the end result would be similar to [rsync --delete](https://askubuntu.com/questions/476041/how-do-i-make-rsync-delete-files-that-have-been-deleted-from-the-source-folder).
 
 
@@ -33,7 +33,44 @@ i.e. the end result would be similar to [rsync --delete](https://askubuntu.com/q
 
 ### Advanced usage
 
-Run `vmrestore -help` in order to see all the available options:
+* Obtaining credentials from a file.
+
+  Add flag `-credsFilePath=/etc/credentials` with following content:
+
+    for s3 (aws, minio or other s3 compatible storages):
+     ```bash
+     [default]
+     aws_access_key_id=theaccesskey
+     aws_secret_access_key=thesecretaccesskeyvalue
+    ```
+
+    for gce cloud storage:
+    ```json
+    {
+           "type": "service_account",
+           "project_id": "project-id",
+           "private_key_id": "key-id",
+           "private_key": "-----BEGIN PRIVATE KEY-----\nprivate-key\n-----END PRIVATE KEY-----\n",
+           "client_email": "service-account-email",
+           "client_id": "client-id",
+           "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+           "token_uri": "https://accounts.google.com/o/oauth2/token",
+           "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+           "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/service-account-email"
+    }
+    ```
+
+* Usage with s3 custom url endpoint.  It is possible to use `vmrestore` with s3 api compatible storages, like  minio, cloudian and other.
+  You have to add custom url endpoint with a flag:
+```
+  # for minio:
+  -customS3Endpoint=http://localhost:9000
+
+  # for aws gov region
+  -customS3Endpoint=https://s3-fips.us-gov-west-1.amazonaws.com
+```
+
+*  Run `vmrestore -help` in order to see all the available options:
 
 ```
   -concurrency int
@@ -42,7 +79,7 @@ Run `vmrestore -help` in order to see all the available options:
     	Path to file with S3 configs. Configs are loaded from default location if not set.
     	See https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html
   -configProfile string
-    	Profile name for S3 configs (default "default")
+    	Profile name for S3 configs. If no set, the value of the environment variable will be loaded (AWS_PROFILE or AWS_DEFAULT_PROFILE), or if both not set, DefaultSharedConfigProfile is used
   -credsFilePath string
     	Path to file with GCS or S3 credentials. Credentials are loaded from default locations if not set.
     	See https://cloud.google.com/iam/docs/creating-managing-service-account-keys and https://docs.aws.amazon.com/general/latest/gr/aws-security-credentials.html
@@ -62,10 +99,12 @@ Run `vmrestore -help` in order to see all the available options:
     	Minimum level of errors to log. Possible values: INFO, WARN, ERROR, FATAL, PANIC (default "INFO")
   -loggerOutput string
     	Output for the logs. Supported values: stderr, stdout (default "stderr")
-  -maxBytesPerSecond int
+  -maxBytesPerSecond value
     	The maximum download speed. There is no limit if it is set to 0
-  -memory.allowedBytes int
+    	Supports the following optional suffixes for values: KB, MB, GB, KiB, MiB, GiB (default 0)
+  -memory.allowedBytes value
     	Allowed size of system memory VictoriaMetrics caches may occupy. This option overrides -memory.allowedPercent if set to non-zero value. Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. Too high value may evict too much data from OS page cache, which will result in higher disk IO usage
+    	Supports the following optional suffixes for values: KB, MB, GB, KiB, MiB, GiB (default 0)
   -memory.allowedPercent float
     	Allowed percent of system memory VictoriaMetrics caches may occupy. See also -memory.allowedBytes. Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. Too high value may evict too much data from OS page cache, which will result in higher disk IO usage (default 60)
   -skipBackupCompleteCheck
@@ -102,7 +141,7 @@ Run `make package-vmrestore`. It builds `victoriametrics/vmrestore:<PKG_TAG>` do
 `<PKG_TAG>` is auto-generated image tag, which depends on source code in the repository.
 The `<PKG_TAG>` may be manually set via `PKG_TAG=foobar make package-vmrestore`.
 
-By default the image is built on top of [alpine](https://hub.docker.com/_/alpine) image. It is possible to build the package on top of any other base image
+The base docker image is [alpine](https://hub.docker.com/_/alpine) but it is possible to use any other base image
 by setting it via `<ROOT_IMAGE>` environment variable. For example, the following command builds the image on top of [scratch](https://hub.docker.com/_/scratch) image:
 
 ```bash

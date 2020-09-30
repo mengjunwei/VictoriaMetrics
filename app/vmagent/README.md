@@ -25,7 +25,8 @@ to `vmagent` (like the ability to push metrics instead of pulling them). We did 
   * Graphite plaintext protocol if `-graphiteListenAddr` command-line flag is set. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-graphite-compatible-agents-such-as-statsd).
   * OpenTSDB telnet and http protocols if `-opentsdbListenAddr` command-line flag is set. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-send-data-from-opentsdb-compatible-agents).
   * Prometheus remote write protocol via `http://<vmagent>:8429/api/v1/write`.
-  * JSON lines import protocol via `http://<vmagent>:8429/api/v1/import`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-time-series-data).
+  * JSON lines import protocol via `http://<vmagent>:8429/api/v1/import`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-data-in-json-line-format).
+  * Native data import protocol via `http://<vmagent>:8429/api/v1/import/native`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-data-in-native-format).
   * Data in Prometheus exposition format. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-data-in-prometheus-exposition-format) for details.
   * Arbitrary CSV data via `http://<vmagent>:8429/api/v1/import/csv`. See [these docs](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-import-csv-data).
 * Can replicate collected metrics simultaneously to multiple remote storage systems.
@@ -41,7 +42,7 @@ Just download `vmutils-*` archive from [releases page](https://github.com/Victor
 and pass the following flags to `vmagent` binary in order to start scraping Prometheus targets:
 
 * `-promscrape.config` with the path to Prometheus config file (it is usually located at `/etc/prometheus/prometheus.yml`)
-* `-remoteWrite.url` with the remote storage endpoint such as VictoriaMetrics. The `-remoteWrite.url` argument can be specified multiple times in order to replicate data concurrently to an arbitrary amount of remote storage systems.
+* `-remoteWrite.url` with the remote storage endpoint such as VictoriaMetrics. The `-remoteWrite.url` argument can be specified multiple times in order to replicate data concurrently to an arbitrary number of remote storage systems.
 
 Example command line:
 
@@ -135,7 +136,7 @@ The following scrape types in [scrape_config](https://prometheus.io/docs/prometh
   See [kubernetes_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config) for details.
 * `ec2_sd_configs` - for scraping targets in Amazon EC2.
   See [ec2_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#ec2_sd_config) for details.
-  `vmagent` doesn't support `role_arn` config param yet.
+  `vmagent` doesn't support `profile` config param and aws credentials file yet.
 * `gce_sd_configs` - for scraping targets in Google Compute Engine (GCE).
   See [gce_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config) for details.
   `vmagent` provides the following additional functionality for `gce_sd_config`:
@@ -218,8 +219,7 @@ If you have suggestions, improvements or found a bug - feel free to open an issu
 * When `vmagent` scrapes many unreliable targets, it can flood error log with scrape errors. These errors can be suppressed
   by passing `-promscrape.suppressScrapeErrors` command-line flag to `vmagent`. The most recent scrape error per each target can be observed at `http://vmagent-host:8429/targets`.
 
-* It is recommended to increase `-remoteWrite.queues` if `vmagent` collects more than 100K samples per second
-  and `vmagent_remotewrite_pending_data_bytes` metric exported at `http://vmagent-host:8429/metrics` page constantly grows.
+* It is recommended to increase `-remoteWrite.queues` if `vmagent_remotewrite_pending_data_bytes` metric exported at `http://vmagent-host:8429/metrics` page constantly grows.
 
 * If you see gaps on the data pushed by `vmagent` to remote storage when `-remoteWrite.maxDiskUsagePerURL` is set, then try increasing `-remoteWrite.queues`.
   Such gaps may appear because `vmagent` cannot keep up with sending the collected data to remote storage, so it starts dropping the buffered data
@@ -228,6 +228,10 @@ If you have suggestions, improvements or found a bug - feel free to open an issu
 * `vmagent` buffers scraped data at `-remoteWrite.tmpDataPath` directory until it is sent to `-remoteWrite.url`.
   The directory can grow large when remote storage is unavailable for extended periods of time and if `-remoteWrite.maxDiskUsagePerURL` isn't set.
   If you don't want to send all the data from the directory to remote storage, simply stop `vmagent` and delete the directory.
+
+* By default `vmagent` masks `-remoteWrite.url` with `secret-url` values in logs and at `/metrics` page because
+  the url may contain sensitive information such as auth tokens or passwords.
+  Pass `-remoteWrite.showURL` command-line flag when starting `vmagent` in order to see all the valid urls.
 
 * If you see `skipping duplicate scrape target with identical labels` errors when scraping Kubernetes pods, then it is likely these pods listen multiple ports
   or they use init container.
@@ -275,7 +279,7 @@ Run `make package-vmagent`. It builds `victoriametrics/vmagent:<PKG_TAG>` docker
 `<PKG_TAG>` is auto-generated image tag, which depends on source code in the repository.
 The `<PKG_TAG>` may be manually set via `PKG_TAG=foobar make package-vmagent`.
 
-By default the image is built on top of [alpine](https://hub.docker.com/_/alpine) image. It is possible to build the package on top of any other base image
+The base docker image is [alpine](https://hub.docker.com/_/alpine) but it is possible to use any other base image
 by setting it via `<ROOT_IMAGE>` environment variable. For example, the following command builds the image on top of [scratch](https://hub.docker.com/_/scratch) image:
 
 ```bash

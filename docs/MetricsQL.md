@@ -115,6 +115,8 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
   Example: `share_le_over_time(memory_usage_bytes[24h], 100*1024*1024)` returns the share of time series values for the last 24 hours when memory usage was below or equal to 100MB.
 - `share_gt_over_time(m[d], gt)` - returns share (in the range 0..1) of values in `m` over `d`, which are bigger than `gt`. Useful for calculating SLI and SLO.
   Example: `share_gt_over_time(up[24h], 0)` - returns service availability for the last 24 hours.
+- `count_le_over_time(m[d], le)` - returns the number of raw samples for `m` over `d`, which don't exceed `le`.
+- `count_gt_over_time(m[d], gt)` - returns the number of raw samples for `m` over `d`, which are bigger than `gt`.
 - `tmin_over_time(m[d])` - returns timestamp for the minimum value for `m` over `d` time range.
 - `tmax_over_time(m[d])` - returns timestamp for the maximum value for `m` over `d` time range.
 - `aggr_over_time(("aggr_func1", "aggr_func2", ...), m[d])` - simultaneously calculates all the listed `aggr_func*` for `m` over `d` time range.
@@ -124,7 +126,7 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
   for the given `phi` in the range `[0..1]`.
 - `last_over_time(m[d])` - returns the last value for `m` on the time range `d`.
 - `first_over_time(m[d])` - returns the first value for `m` on the time range `d`.
-- `outliersk(N, q) by (group)` - returns up to `N` outlier time series for `q` in every `group`. Outlier time series have the highest deviation from the `median(m)`.
+- `outliersk(N, q) by (group)` - returns up to `N` outlier time series for `q` in every `group`. Outlier time series have the highest deviation from the `median(q)`.
   This aggregate function is useful to detect anomalies across groups of similar time series.
 - `ascent_over_time(m[d])` - returns the sum of positive deltas between adjancent data points in `m` over `d`. Useful for tracking height gains in GPS track.
 - `descent_over_time(m[d])` - returns the absolute sum of negative deltas between adjancent data points in `m` over `d`. Useful for tracking height loss in GPS track.

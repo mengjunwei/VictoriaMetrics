@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,9 +25,10 @@ import (
 )
 
 var (
-	maxTagKeysPerSearch   = flag.Int("search.maxTagKeys", 100e3, "The maximum number of tag keys returned per search")
-	maxTagValuesPerSearch = flag.Int("search.maxTagValues", 100e3, "The maximum number of tag values returned per search")
-	maxMetricsPerSearch   = flag.Int("search.maxUniqueTimeseries", 300e3, "The maximum number of unique time series each search can scan")
+	maxTagKeysPerSearch          = flag.Int("search.maxTagKeys", 100e3, "The maximum number of tag keys returned per search")
+	maxTagValuesPerSearch        = flag.Int("search.maxTagValues", 100e3, "The maximum number of tag values returned per search")
+	maxTagValueSuffixesPerSearch = flag.Int("search.maxTagValueSuffixesPerSearch", 100e3, "The maximum number of tag value suffixes returned from /metrics/find")
+	maxMetricsPerSearch          = flag.Int("search.maxUniqueTimeseries", 300e3, "The maximum number of unique time series each search can scan")
 
 	precisionBits         = flag.Int("precisionBits", 64, "The number of precision bits to store per each value. Lower precision bits improves data compression at the cost of precision loss")
 	disableRPCCompression = flag.Bool(`rpc.disableCompression`, false, "Disable compression of RPC traffic. This reduces CPU usage at the cost of higher network bandwidth usage")
@@ -293,17 +295,9 @@ func (s *Server) isStopping() bool {
 
 func (s *Server) processVMInsertConn(bc *handshake.BufferedConn) error {
 	sizeBuf := make([]byte, 8)
-	var buf []byte
-	var mrs []storage.MetricRow
-	lastMRsResetTime := fasttime.UnixTimestamp()
+	var reqBuf []byte
+	remoteAddr := bc.RemoteAddr().String()
 	for {
-		if fasttime.UnixTimestamp()-lastMRsResetTime > 10 {
-			// Periodically reset mrs in order to prevent from gradual memory usage growth
-			// when ceratin entries in mr contain too long labels.
-			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/490 for details.
-			mrs = nil
-			lastMRsResetTime = fasttime.UnixTimestamp()
-		}
 		if _, err := io.ReadFull(bc, sizeBuf); err != nil {
 			if err == io.EOF {
 				// Remote end gracefully closed the connection.
@@ -315,11 +309,11 @@ func (s *Server) processVMInsertConn(bc *handshake.BufferedConn) error {
 		if packetSize > consts.MaxInsertPacketSize {
 			return fmt.Errorf("too big packet size: %d; shouldn't exceed %d", packetSize, consts.MaxInsertPacketSize)
 		}
-		buf = bytesutil.Resize(buf, int(packetSize))
-		if n, err := io.ReadFull(bc, buf); err != nil {
+		reqBuf = bytesutil.Resize(reqBuf, int(packetSize))
+		if n, err := io.ReadFull(bc, reqBuf); err != nil {
 			return fmt.Errorf("cannot read packet with size %d: %w; read only %d bytes", packetSize, err, n)
 		}
-		// Send `ack` to vminsert that we recevied the packet.
+		// Send `ack` to vminsert that the packet has been received.
 		deadline := time.Now().Add(5 * time.Second)
 		if err := bc.SetWriteDeadline(deadline); err != nil {
 			return fmt.Errorf("cannot set write deadline for sending `ack` to vminsert: %w", err)
@@ -333,36 +327,11 @@ func (s *Server) processVMInsertConn(bc *handshake.BufferedConn) error {
 		}
 		vminsertPacketsRead.Inc()
 
-		// Read metric rows from the packet.
-		mrs = mrs[:0]
-		tail := buf
-		for len(tail) > 0 {
-			if len(mrs) < cap(mrs) {
-				mrs = mrs[:len(mrs)+1]
-			} else {
-				mrs = append(mrs, storage.MetricRow{})
-			}
-			mr := &mrs[len(mrs)-1]
-			var err error
-			tail, err = mr.Unmarshal(tail)
-			if err != nil {
-				return fmt.Errorf("cannot unmarshal MetricRow: %w", err)
-			}
-			if len(mrs) >= 10000 {
-				// Store the collected mrs in order to reduce memory usage
-				// when too big number of mrs are sent in each packet.
-				// This should help with https://github.com/VictoriaMetrics/VictoriaMetrics/issues/490
-				vminsertMetricsRead.Add(len(mrs))
-				if err := s.storage.AddRows(mrs, uint8(*precisionBits)); err != nil {
-					return fmt.Errorf("cannot store metrics: %w", err)
-				}
-				mrs = mrs[:0]
-			}
-		}
-		vminsertMetricsRead.Add(len(mrs))
-		if err := s.storage.AddRows(mrs, uint8(*precisionBits)); err != nil {
-			return fmt.Errorf("cannot store metrics: %w", err)
-		}
+		uw := getUnmarshalWork()
+		uw.storage = s.storage
+		uw.remoteAddr = remoteAddr
+		uw.reqBuf, reqBuf = reqBuf, uw.reqBuf
+		unmarshalWorkCh <- uw
 	}
 }
 
@@ -370,6 +339,114 @@ var (
 	vminsertPacketsRead = metrics.NewCounter("vm_vminsert_packets_read_total")
 	vminsertMetricsRead = metrics.NewCounter("vm_vminsert_metrics_read_total")
 )
+
+func getUnmarshalWork() *unmarshalWork {
+	v := unmarshalWorkPool.Get()
+	if v == nil {
+		return &unmarshalWork{}
+	}
+	return v.(*unmarshalWork)
+}
+
+// StartUnmarshalWorkers starts workers for unmarshaling data obtained from vminsert connections.
+//
+// This function must be called before servers are created via NewServer.
+func StartUnmarshalWorkers() {
+	gomaxprocs := runtime.GOMAXPROCS(-1)
+	unmarshalWorkCh = make(chan *unmarshalWork, gomaxprocs)
+	unmarshalWorkersWG.Add(gomaxprocs)
+	for i := 0; i < gomaxprocs; i++ {
+		go func() {
+			defer unmarshalWorkersWG.Done()
+			for uw := range unmarshalWorkCh {
+				uw.Unmarshal()
+				putUnmarshalWork(uw)
+			}
+		}()
+	}
+}
+
+// StopUnmarshalWorkers stops unmarshal workers which were started with StartUnmarshalWorkers.
+//
+// This function must be called after Server.MustClose().
+func StopUnmarshalWorkers() {
+	close(unmarshalWorkCh)
+	unmarshalWorkersWG.Wait()
+}
+
+var (
+	unmarshalWorkCh    chan *unmarshalWork
+	unmarshalWorkersWG sync.WaitGroup
+)
+
+func putUnmarshalWork(uw *unmarshalWork) {
+	uw.reset()
+	unmarshalWorkPool.Put(uw)
+}
+
+var unmarshalWorkPool sync.Pool
+
+type unmarshalWork struct {
+	storage       *storage.Storage
+	remoteAddr    string
+	mrs           []storage.MetricRow
+	reqBuf        []byte
+	lastResetTime uint64
+}
+
+func (uw *unmarshalWork) reset() {
+	if (len(uw.mrs)*4 > cap(uw.mrs) || len(uw.reqBuf)*4 > cap(uw.reqBuf)) && fasttime.UnixTimestamp()-uw.lastResetTime > 10 {
+		// Periodically reset mrs and reqBuf in order to prevent from gradual memory usage growth
+		// when ceratin entries in mr contain too long labels.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/490 for details.
+		uw.mrs = nil
+		uw.reqBuf = nil
+		uw.lastResetTime = fasttime.UnixTimestamp()
+	}
+	uw.storage = nil
+	uw.remoteAddr = ""
+	uw.mrs = uw.mrs[:0]
+	uw.reqBuf = uw.reqBuf[:0]
+}
+
+func (uw *unmarshalWork) Unmarshal() {
+	mrs := uw.mrs[:0]
+	tail := uw.reqBuf
+	for len(tail) > 0 {
+		if len(mrs) < cap(mrs) {
+			mrs = mrs[:len(mrs)+1]
+		} else {
+			mrs = append(mrs, storage.MetricRow{})
+		}
+		mr := &mrs[len(mrs)-1]
+		var err error
+		tail, err = mr.Unmarshal(tail)
+		if err != nil {
+			logger.Errorf("cannot unmarshal MetricRow obtained from %s: %s", uw.remoteAddr, err)
+			uw.mrs = mrs[:0]
+			return
+		}
+		if len(mrs) >= 10000 {
+			// Store the collected mrs in order to reduce memory usage
+			// when too big number of mrs are sent in each packet.
+			// This should help with https://github.com/VictoriaMetrics/VictoriaMetrics/issues/490
+			uw.mrs = mrs
+			uw.flushRows()
+			mrs = uw.mrs[:0]
+		}
+	}
+	uw.mrs = mrs
+	uw.flushRows()
+}
+
+func (uw *unmarshalWork) flushRows() {
+	vminsertMetricsRead.Add(len(uw.mrs))
+	err := uw.storage.AddRows(uw.mrs, uint8(*precisionBits))
+	uw.mrs = uw.mrs[:0]
+	if err != nil {
+		logger.Errorf("cannot store metrics obtained from %s: %s", uw.remoteAddr, err)
+	}
+}
 
 func (s *Server) processVMSelectConn(bc *handshake.BufferedConn) error {
 	ctx := &vmselectRequestCtx{
@@ -422,6 +499,30 @@ func (ctx *vmselectRequestCtx) readUint32() (uint32, error) {
 	return n, nil
 }
 
+func (ctx *vmselectRequestCtx) readUint64() (uint64, error) {
+	ctx.sizeBuf = bytesutil.Resize(ctx.sizeBuf, 8)
+	if _, err := io.ReadFull(ctx.bc, ctx.sizeBuf); err != nil {
+		if err == io.EOF {
+			return 0, err
+		}
+		return 0, fmt.Errorf("cannot read uint64: %w", err)
+	}
+	n := encoding.UnmarshalUint64(ctx.sizeBuf)
+	return n, nil
+}
+
+func (ctx *vmselectRequestCtx) readAccountIDProjectID() (uint32, uint32, error) {
+	accountID, err := ctx.readUint32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("cannot read accountID: %w", err)
+	}
+	projectID, err := ctx.readUint32()
+	if err != nil {
+		return 0, 0, fmt.Errorf("cannot read projectID: %w", err)
+	}
+	return accountID, projectID, nil
+}
+
 func (ctx *vmselectRequestCtx) readDataBufBytes(maxDataSize int) error {
 	ctx.sizeBuf = bytesutil.Resize(ctx.sizeBuf, 8)
 	if _, err := io.ReadFull(ctx.bc, ctx.sizeBuf); err != nil {
@@ -454,6 +555,18 @@ func (ctx *vmselectRequestCtx) readBool() (bool, error) {
 	}
 	v := ctx.dataBuf[0] != 0
 	return v, nil
+}
+
+func (ctx *vmselectRequestCtx) readByte() (byte, error) {
+	ctx.dataBuf = bytesutil.Resize(ctx.dataBuf, 1)
+	if _, err := io.ReadFull(ctx.bc, ctx.dataBuf); err != nil {
+		if err == io.EOF {
+			return 0, err
+		}
+		return 0, fmt.Errorf("cannot read byte: %w", err)
+	}
+	b := ctx.dataBuf[0]
+	return b, nil
 }
 
 func (ctx *vmselectRequestCtx) writeDataBufBytes() error {
@@ -538,6 +651,8 @@ func (s *Server) processVMSelectRequest(ctx *vmselectRequestCtx) error {
 		return s.processVMSelectSearchQuery(ctx)
 	case "labelValues_v2":
 		return s.processVMSelectLabelValues(ctx)
+	case "tagValueSuffixes_v1":
+		return s.processVMSelectTagValueSuffixes(ctx)
 	case "labelEntries_v2":
 		return s.processVMSelectLabelEntries(ctx)
 	case "labels_v2":
@@ -596,13 +711,9 @@ func (s *Server) processVMSelectLabels(ctx *vmselectRequestCtx) error {
 	vmselectLabelsRequests.Inc()
 
 	// Read request
-	accountID, err := ctx.readUint32()
+	accountID, projectID, err := ctx.readAccountIDProjectID()
 	if err != nil {
-		return fmt.Errorf("cannot read accountID: %w", err)
-	}
-	projectID, err := ctx.readUint32()
-	if err != nil {
-		return fmt.Errorf("cannot read projectID: %w", err)
+		return err
 	}
 
 	// Search for tag keys
@@ -640,13 +751,9 @@ func (s *Server) processVMSelectLabelValues(ctx *vmselectRequestCtx) error {
 	vmselectLabelValuesRequests.Inc()
 
 	// Read request
-	accountID, err := ctx.readUint32()
+	accountID, projectID, err := ctx.readAccountIDProjectID()
 	if err != nil {
-		return fmt.Errorf("cannot read accountID: %w", err)
-	}
-	projectID, err := ctx.readUint32()
-	if err != nil {
-		return fmt.Errorf("cannot read projectID: %w", err)
+		return err
 	}
 	if err := ctx.readDataBufBytes(maxLabelValueSize); err != nil {
 		return fmt.Errorf("cannot read labelName: %w", err)
@@ -665,6 +772,63 @@ func (s *Server) processVMSelectLabelValues(ctx *vmselectRequestCtx) error {
 	}
 
 	return writeLabelValues(ctx, labelValues)
+}
+
+func (s *Server) processVMSelectTagValueSuffixes(ctx *vmselectRequestCtx) error {
+	vmselectTagValueSuffixesRequests.Inc()
+
+	// read request
+	accountID, projectID, err := ctx.readAccountIDProjectID()
+	if err != nil {
+		return err
+	}
+	minTimestamp, err := ctx.readUint64()
+	if err != nil {
+		return fmt.Errorf("cannot read minTimestamp: %w", err)
+	}
+	maxTimestamp, err := ctx.readUint64()
+	if err != nil {
+		return fmt.Errorf("cannot read maxTimestamp: %w", err)
+	}
+	if err := ctx.readDataBufBytes(maxLabelValueSize); err != nil {
+		return fmt.Errorf("cannot read tagKey: %w", err)
+	}
+	tagKey := append([]byte{}, ctx.dataBuf...)
+	if err := ctx.readDataBufBytes(maxLabelValueSize); err != nil {
+		return fmt.Errorf("cannot read tagValuePrefix: %w", err)
+	}
+	tagValuePrefix := append([]byte{}, ctx.dataBuf...)
+	delimiter, err := ctx.readByte()
+	if err != nil {
+		return fmt.Errorf("cannot read delimiter: %w", err)
+	}
+
+	// Search for tag value suffixes
+	tr := storage.TimeRange{
+		MinTimestamp: int64(minTimestamp),
+		MaxTimestamp: int64(maxTimestamp),
+	}
+	suffixes, err := s.storage.SearchTagValueSuffixes(accountID, projectID, tr, tagKey, tagValuePrefix, delimiter, *maxTagValueSuffixesPerSearch, ctx.deadline)
+	if err != nil {
+		return ctx.writeErrorMessage(err)
+	}
+
+	// Send an empty error message to vmselect.
+	if err := ctx.writeString(""); err != nil {
+		return fmt.Errorf("cannot send empty error message: %w", err)
+	}
+
+	// Send suffixes to vmselect.
+	// Suffixes may contain empty string, so prepend suffixes with suffixCount.
+	if err := ctx.writeUint64(uint64(len(suffixes))); err != nil {
+		return fmt.Errorf("cannot write suffixesCount: %w", err)
+	}
+	for i, suffix := range suffixes {
+		if err := ctx.writeString(suffix); err != nil {
+			return fmt.Errorf("cannot write suffix #%d: %w", i+1, err)
+		}
+	}
+	return nil
 }
 
 func writeLabelValues(ctx *vmselectRequestCtx, labelValues []string) error {
@@ -688,13 +852,9 @@ func (s *Server) processVMSelectLabelEntries(ctx *vmselectRequestCtx) error {
 	vmselectLabelEntriesRequests.Inc()
 
 	// Read request
-	accountID, err := ctx.readUint32()
+	accountID, projectID, err := ctx.readAccountIDProjectID()
 	if err != nil {
-		return fmt.Errorf("cannot read accountID: %w", err)
-	}
-	projectID, err := ctx.readUint32()
-	if err != nil {
-		return fmt.Errorf("cannot read projectID: %w", err)
+		return err
 	}
 
 	// Perform the request
@@ -735,13 +895,9 @@ func (s *Server) processVMSelectSeriesCount(ctx *vmselectRequestCtx) error {
 	vmselectSeriesCountRequests.Inc()
 
 	// Read request
-	accountID, err := ctx.readUint32()
+	accountID, projectID, err := ctx.readAccountIDProjectID()
 	if err != nil {
-		return fmt.Errorf("cannot read accountID: %w", err)
-	}
-	projectID, err := ctx.readUint32()
-	if err != nil {
-		return fmt.Errorf("cannot read projectID: %w", err)
+		return err
 	}
 
 	// Execute the request
@@ -766,13 +922,9 @@ func (s *Server) processVMSelectTSDBStatus(ctx *vmselectRequestCtx) error {
 	vmselectTSDBStatusRequests.Inc()
 
 	// Read request
-	accountID, err := ctx.readUint32()
+	accountID, projectID, err := ctx.readAccountIDProjectID()
 	if err != nil {
-		return fmt.Errorf("cannot read accountID: %w", err)
-	}
-	projectID, err := ctx.readUint32()
-	if err != nil {
-		return fmt.Errorf("cannot read projectID: %w", err)
+		return err
 	}
 	date, err := ctx.readUint32()
 	if err != nil {
@@ -907,15 +1059,16 @@ func checkTimeRange(s *storage.Storage, tr storage.TimeRange) error {
 }
 
 var (
-	vmselectDeleteMetricsRequests = metrics.NewCounter("vm_vmselect_delete_metrics_requests_total")
-	vmselectLabelsRequests        = metrics.NewCounter("vm_vmselect_labels_requests_total")
-	vmselectLabelValuesRequests   = metrics.NewCounter("vm_vmselect_label_values_requests_total")
-	vmselectLabelEntriesRequests  = metrics.NewCounter("vm_vmselect_label_entries_requests_total")
-	vmselectSeriesCountRequests   = metrics.NewCounter("vm_vmselect_series_count_requests_total")
-	vmselectTSDBStatusRequests    = metrics.NewCounter("vm_vmselect_tsdb_status_requests_total")
-	vmselectSearchQueryRequests   = metrics.NewCounter("vm_vmselect_search_query_requests_total")
-	vmselectMetricBlocksRead      = metrics.NewCounter("vm_vmselect_metric_blocks_read_total")
-	vmselectMetricRowsRead        = metrics.NewCounter("vm_vmselect_metric_rows_read_total")
+	vmselectDeleteMetricsRequests    = metrics.NewCounter("vm_vmselect_delete_metrics_requests_total")
+	vmselectLabelsRequests           = metrics.NewCounter("vm_vmselect_labels_requests_total")
+	vmselectLabelValuesRequests      = metrics.NewCounter("vm_vmselect_label_values_requests_total")
+	vmselectTagValueSuffixesRequests = metrics.NewCounter("vm_vmselect_tag_value_suffixes_requests_total")
+	vmselectLabelEntriesRequests     = metrics.NewCounter("vm_vmselect_label_entries_requests_total")
+	vmselectSeriesCountRequests      = metrics.NewCounter("vm_vmselect_series_count_requests_total")
+	vmselectTSDBStatusRequests       = metrics.NewCounter("vm_vmselect_tsdb_status_requests_total")
+	vmselectSearchQueryRequests      = metrics.NewCounter("vm_vmselect_search_query_requests_total")
+	vmselectMetricBlocksRead         = metrics.NewCounter("vm_vmselect_metric_blocks_read_total")
+	vmselectMetricRowsRead           = metrics.NewCounter("vm_vmselect_metric_rows_read_total")
 )
 
 func (ctx *vmselectRequestCtx) setupTfss() error {
