@@ -21,6 +21,9 @@ var (
 	kubernetesSDCheckInterval = flag.Duration("promscrape.kubernetesSDCheckInterval", 30*time.Second, "Interval for checking for changes in Kubernetes API server. "+
 		"This works only if `kubernetes_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config for details")
+	openstackSDCheckInterval = flag.Duration("promscrape.openstackSDCheckInterval", 30*time.Second, "Interval for checking for changes in openstack API server. "+
+		"This works only if `openstack_sd_configs` is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config for details")
 	consulSDCheckInterval = flag.Duration("promscrape.consulSDCheckInterval", 30*time.Second, "Interval for checking for changes in consul. "+
 		"This works only if `consul_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config for details")
@@ -33,8 +36,13 @@ var (
 	gceSDCheckInterval = flag.Duration("promscrape.gceSDCheckInterval", time.Minute, "Interval for checking for changes in gce. "+
 		"This works only if `gce_sd_configs` is configured in '-promscrape.config' file. "+
 		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config for details")
+	dockerswarmSDCheckInterval = flag.Duration("promscrape.dockerswarmSDCheckInterval", 30*time.Second, "Interval for checking for changes in dockerswarm. "+
+		"This works only if `dockerswarm_sd_configs` is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config for details")
 	promscrapeConfigFile = flag.String("promscrape.config", "", "Optional path to Prometheus config file with 'scrape_configs' section containing targets to scrape. "+
 		"See https://victoriametrics.github.io/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
+	suppressDuplicateScrapeTargetErrors = flag.Bool("promscrape.suppressDuplicateScrapeTargetErrors", false, "Whether to suppress `duplicate scrape target` errors; "+
+		"see https://victoriametrics.github.io/vmagent.html#troubleshooting for details")
 )
 
 // CheckConfig checks -promscrape.config for errors and unsupported options.
@@ -85,10 +93,12 @@ func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest)
 	scs.add("static_configs", 0, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getStaticScrapeWork() })
 	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
 	scs.add("kubernetes_sd_configs", *kubernetesSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
+	scs.add("openstack_sd_configs", *openstackSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
 	scs.add("consul_sd_configs", *consulSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
 	scs.add("dns_sd_configs", *dnsSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
 	scs.add("ec2_sd_configs", *ec2SDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getEC2SDScrapeWork(swsPrev) })
 	scs.add("gce_sd_configs", *gceSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
+	scs.add("dockerswarm_sd_configs", *dockerswarmSDCheckInterval, func(cfg *Config, swsPrev []ScrapeWork) []ScrapeWork { return cfg.getDockerSwarmSDScrapeWork(swsPrev) })
 
 	sighupCh := procutil.NewSighupChan()
 
@@ -261,18 +271,22 @@ func (sg *scraperGroup) update(sws []ScrapeWork) {
 
 	additionsCount := 0
 	deletionsCount := 0
-	swsMap := make(map[string]bool, len(sws))
+	swsMap := make(map[string][]prompbmarshal.Label, len(sws))
 	for i := range sws {
 		sw := &sws[i]
 		key := sw.key()
-		if swsMap[key] {
-			logger.Errorf("skipping duplicate scrape target with identical labels; endpoint=%s, labels=%s; "+
-				"make sure service discovery and relabeling is set up properly; "+
-				"see also https://victoriametrics.github.io/vmagent.html#troubleshooting",
-				sw.ScrapeURL, sw.LabelsString())
+		originalLabels := swsMap[key]
+		if originalLabels != nil {
+			if !*suppressDuplicateScrapeTargetErrors {
+				logger.Errorf("skipping duplicate scrape target with identical labels; endpoint=%s, labels=%s; "+
+					"make sure service discovery and relabeling is set up properly; "+
+					"see also https://victoriametrics.github.io/vmagent.html#troubleshooting; "+
+					"original labels for target1: %s; original labels for target2: %s",
+					sw.ScrapeURL, sw.LabelsString(), promLabelsString(originalLabels), promLabelsString(sw.OriginalLabels))
+			}
 			continue
 		}
-		swsMap[key] = true
+		swsMap[key] = sw.OriginalLabels
 		if sg.m[key] != nil {
 			// The scraper for the given key already exists.
 			continue
@@ -293,7 +307,7 @@ func (sg *scraperGroup) update(sws []ScrapeWork) {
 
 	// Stop deleted scrapers, which are missing in sws.
 	for key, sc := range sg.m {
-		if !swsMap[key] {
+		if swsMap[key] == nil {
 			close(sc.stopCh)
 			delete(sg.m, key)
 			deletionsCount++

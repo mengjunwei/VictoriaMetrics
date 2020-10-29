@@ -148,6 +148,11 @@ The following scrape types in [scrape_config](https://prometheus.io/docs/prometh
   See [consul_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config) for details.
 * `dns_sd_configs` - for scraping targets discovered from DNS records (SRV, A and AAAA).
   See [dns_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dns_sd_config) for details.
+* `openstack_sd_configs` - for scraping OpenStack targets.
+  See [openstack_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config) for details.
+  [OpenStack identity API v3](https://docs.openstack.org/api-ref/identity/v3/) is supported only.
+* `dockerswarm_sd_configs` - for scraping Docker Swarm targets.
+  See [dockerswarm_sd_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config) for details.
 
 File feature requests at [our issue tracker](https://github.com/VictoriaMetrics/VictoriaMetrics/issues) if you need other service discovery mechanisms to be supported by `vmagent`.
 
@@ -207,6 +212,8 @@ Use official [Grafana dashboard](https://grafana.com/grafana/dashboards/12683) f
 If you have suggestions, improvements or found a bug - feel free to open an issue on github or add review to the dashboard.
 
 `vmagent` also exports target statuses at `http://vmagent-host:8429/targets` page in plaintext format.
+`/targets` handler accepts optional `show_original_labels=1` query arg, which shows the original labels per each target
+before applying relabeling. This information may be useful for debugging target relabeling.
 
 
 ### Troubleshooting
@@ -234,7 +241,8 @@ If you have suggestions, improvements or found a bug - feel free to open an issu
   Pass `-remoteWrite.showURL` command-line flag when starting `vmagent` in order to see all the valid urls.
 
 * If you see `skipping duplicate scrape target with identical labels` errors when scraping Kubernetes pods, then it is likely these pods listen multiple ports
-  or they use init container.
+  or they use init container. These errors can be either fixed or suppressed with `-promscrape.suppressDuplicateScrapeTargetErrors` command-line flag.
+  See available options below if you prefer fixing the root cause of the error:
 
   The following `relabel_configs` section may help determining `__meta_*` labels resulting in duplicate targets:
   ```yml

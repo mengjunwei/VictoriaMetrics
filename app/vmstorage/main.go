@@ -30,6 +30,9 @@ var (
 	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
 	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
 
+	finalMergeDelay = flag.Duration("finalMergeDelay", 30*time.Second, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
+		"Query speed and disk space usage is usually reduced after the final merge is complete. Too low delay for final merge may result in increased "+
+		"disk IO usage and CPU usage")
 	bigMergeConcurrency   = flag.Int("bigMergeConcurrency", 0, "The maximum number of CPU cores to use for big merges. Default value is used if set to 0")
 	smallMergeConcurrency = flag.Int("smallMergeConcurrency", 0, "The maximum number of CPU cores to use for small merges. Default value is used if set to 0")
 	minScrapeInterval     = flag.Duration("dedup.minScrapeInterval", 0, "Remove superflouos samples from time series if they are located closer to each other than this duration. "+
@@ -46,6 +49,7 @@ func main() {
 	cgroup.UpdateGOMAXPROCSToCPUQuota()
 
 	storage.SetMinScrapeIntervalForDeduplication(*minScrapeInterval)
+	storage.SetFinalMergeDelay(*finalMergeDelay)
 	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
 	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
 
@@ -110,6 +114,10 @@ func main() {
 
 func newRequestHandler(strg *storage.Storage) httpserver.RequestHandler {
 	return func(w http.ResponseWriter, r *http.Request) bool {
+		if r.RequestURI == "/" {
+			fmt.Fprintf(w, "vmstorage - a component of VictoriaMetrics cluster. See docs at https://victoriametrics.github.io/Cluster-VictoriaMetrics.html")
+			return true
+		}
 		return requestHandler(w, r, strg)
 	}
 }
@@ -298,12 +306,6 @@ func registerStorageMetrics(strg *storage.Storage) {
 	metrics.NewGauge(`vm_missing_tsids_for_metric_id_total`, func() float64 {
 		return float64(idbm().MissingTSIDsForMetricID)
 	})
-	metrics.NewGauge(`vm_recent_hour_metric_ids_search_calls_total`, func() float64 {
-		return float64(idbm().RecentHourMetricIDsSearchCalls)
-	})
-	metrics.NewGauge(`vm_recent_hour_metric_ids_search_hits_total`, func() float64 {
-		return float64(idbm().RecentHourMetricIDsSearchHits)
-	})
 	metrics.NewGauge(`vm_date_metric_ids_search_calls_total`, func() float64 {
 		return float64(idbm().DateMetricIDsSearchCalls)
 	})
@@ -369,6 +371,9 @@ func registerStorageMetrics(strg *storage.Storage) {
 		return float64(idbm().SizeBytes)
 	})
 
+	metrics.NewGauge(`vm_rows_added_to_storage_total`, func() float64 {
+		return float64(m().RowsAddedTotal)
+	})
 	metrics.NewGauge(`vm_deduplicated_samples_total{type="merge"}`, func() float64 {
 		return float64(m().DedupsDuringMerge)
 	})
