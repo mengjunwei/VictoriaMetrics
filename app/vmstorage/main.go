@@ -13,6 +13,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -22,13 +23,14 @@ import (
 )
 
 var (
+	retentionPeriod   = flagutil.NewDuration("retentionPeriod", 1, "Data with timestamps outside the retentionPeriod is automatically deleted")
 	httpListenAddr    = flag.String("httpListenAddr", ":8482", "Address to listen for http connections")
-	retentionPeriod   = flag.Int("retentionPeriod", 1, "Retention period in months")
 	storageDataPath   = flag.String("storageDataPath", "vmstorage-data", "Path to storage data")
 	vminsertAddr      = flag.String("vminsertAddr", ":8400", "TCP address to accept connections from vminsert services")
 	vmselectAddr      = flag.String("vmselectAddr", ":8401", "TCP address to accept connections from vmselect services")
 	snapshotAuthKey   = flag.String("snapshotAuthKey", "", "authKey, which must be passed in query string to /snapshot* pages")
 	forceMergeAuthKey = flag.String("forceMergeAuthKey", "", "authKey, which must be passed in query string to /internal/force_merge pages")
+	forceFlushAuthKey = flag.String("forceFlushAuthKey", "", "authKey, which must be passed in query string to /internal/force_flush pages")
 
 	finalMergeDelay = flag.Duration("finalMergeDelay", 30*time.Second, "The delay before starting final merge for per-month partition after no new data is ingested into it. "+
 		"Query speed and disk space usage is usually reduced after the final merge is complete. Too low delay for final merge may result in increased "+
@@ -53,11 +55,11 @@ func main() {
 	storage.SetBigMergeWorkersCount(*bigMergeConcurrency)
 	storage.SetSmallMergeWorkersCount(*smallMergeConcurrency)
 
-	logger.Infof("opening storage at %q with retention period %d months", *storageDataPath, *retentionPeriod)
+	logger.Infof("opening storage at %q with -retentionPeriod=%s", *storageDataPath, retentionPeriod)
 	startTime := time.Now()
-	strg, err := storage.OpenStorage(*storageDataPath, *retentionPeriod)
+	strg, err := storage.OpenStorage(*storageDataPath, retentionPeriod.Msecs)
 	if err != nil {
-		logger.Fatalf("cannot open a storage at %s with retention period %d months: %s", *storageDataPath, *retentionPeriod, err)
+		logger.Fatalf("cannot open a storage at %s with -retentionPeriod=%s: %s", *storageDataPath, retentionPeriod, err)
 	}
 
 	var m storage.Metrics
@@ -145,6 +147,16 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 		}()
 		return true
 	}
+	if path == "/internal/force_flush" {
+		authKey := r.FormValue("authKey")
+		if authKey != *forceFlushAuthKey {
+			httpserver.Errorf(w, r, "invalid authKey %q. It must match the value from -forceFlushAuthKey command line flag", authKey)
+			return true
+		}
+		logger.Infof("flushing storage to make pending data available for reading")
+		strg.DebugFlush()
+		return true
+	}
 	if !strings.HasPrefix(path, "/snapshot") {
 		return false
 	}
@@ -157,7 +169,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 
 	switch path {
 	case "/create":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshotPath, err := strg.CreateSnapshot()
 		if err != nil {
 			err = fmt.Errorf("cannot create snapshot: %w", err)
@@ -167,7 +179,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 		fmt.Fprintf(w, `{"status":"ok","snapshot":%q}`, snapshotPath)
 		return true
 	case "/list":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshots, err := strg.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)
@@ -184,7 +196,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 		fmt.Fprintf(w, `]}`)
 		return true
 	case "/delete":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshotName := r.FormValue("snapshot")
 		if err := strg.DeleteSnapshot(snapshotName); err != nil {
 			err = fmt.Errorf("cannot delete snapshot %q: %w", snapshotName, err)
@@ -194,7 +206,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request, strg *storage.Storag
 		fmt.Fprintf(w, `{"status":"ok"}`)
 		return true
 	case "/delete_all":
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		snapshots, err := strg.ListSnapshots()
 		if err != nil {
 			err = fmt.Errorf("cannot list snapshots: %w", err)

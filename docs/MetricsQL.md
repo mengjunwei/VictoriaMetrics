@@ -28,7 +28,7 @@ Feel free [filing a feature request](https://github.com/VictoriaMetrics/Victoria
 
 This functionality can be tried at [an editable Grafana dashboard](http://play-grafana.victoriametrics.com:3000/d/4ome8yJmz/node-exporter-on-victoriametrics-demo).
 
-- [`WITH` templates](https://play.victoriametrics.com/promql/expand-with-exprs). This feature simplifies writing and managing complex queries. Go to [`WITH` templates playground](https://victoriametrics.com/promql/expand-with-exprs) and try it.
+- [`WITH` templates](https://play.victoriametrics.com/promql/expand-with-exprs). This feature simplifies writing and managing complex queries. Go to [`WITH` templates playground](https://play.victoriametrics.com/promql/expand-with-exprs) and try it.
 - Range duration in functions such as [rate](https://prometheus.io/docs/prometheus/latest/querying/functions/#rate()) may be omitted. VictoriaMetrics automatically selects range duration depending on the current step used for building the graph. For instance, the following query is valid in VictoriaMetrics: `rate(node_network_receive_bytes_total)`.
 - All the aggregate functions support optional `limit N` suffix in order to limit the number of output series. For example, `sum(x) by (y) limit 10` limits
   the number of output time series after the aggregation to 10. All the other time series are dropped.
@@ -71,7 +71,7 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
 - `ideriv(m)` - for calculating `instant` derivative for `m`.
 - `deriv_fast(m[d])` - for calculating `fast` derivative for `m` based on the first and the last points from duration `d`.
 - `running_` functions - `running_sum`, `running_min`, `running_max`, `running_avg` - for calculating [running values](https://en.wikipedia.org/wiki/Running_total) on the selected time range.
-- `range_` functions - `range_sum`, `range_min`, `range_max`, `range_avg`, `range_first`, `range_last`, `range_median`, `range_quantile` - for calculating global value over the selected time range.
+- `range_` functions - `range_sum`, `range_min`, `range_max`, `range_avg`, `range_first`, `range_last`, `range_median`, `range_quantile` - for calculating global value over the selected time range. Note that global value is based on calculated datapoints for the inner query. The calculated datapoints can differ from raw datapoints stored in the database. See [these docs](https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness) for details.
 - `smooth_exponential(q, sf)` - smooths `q` using [exponential moving average](https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average) with the given smooth factor `sf`.
 - `remove_resets(q)` - removes counter resets from `q`.
 - `lag(q[d])` - returns lag between the current timestamp and the timestamp from the previous data point in `q` over `d`.
@@ -101,8 +101,8 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
 - `histogram_over_time(m[d])` - calculates [VictoriaMetrics histogram](https://godoc.org/github.com/VictoriaMetrics/metrics#Histogram) for `m` over `d`.
   For example, the following query calculates median temperature by country over the last 24 hours:
   `histogram_quantile(0.5, sum(histogram_over_time(temperature[24h])) by (vmbucket, country))`.
-- `histogram_share(le, buckets)` - returns share (in the range 0..1) for `buckets`. Useful for calculating SLI and SLO.
-  For instance, the following query returns the share of requests which are performed under 1.5 seconds: `histogram_share(1.5, sum(request_duration_seconds_bucket) by (le))`.
+- `histogram_share(le, buckets)` - returns share (in the range 0..1) for `buckets` that fall below `le`. Useful for calculating SLI and SLO.
+  For instance, the following query returns the share of requests which are performed under 1.5 seconds during the last 5 minutes: `histogram_share(1.5, sum(rate(request_duration_seconds_bucket[5m])) by (le))`.
 - `topk_*` and `bottomk_*` aggregate functions, which return up to K time series. Note that the standard `topk` function may return more than K time series -
    see [this article](https://www.robustperception.io/graph-top-n-time-series-in-grafana) for details.
    - `topk_min(k, q)` - returns top K time series with the max minimums on the given time range
@@ -112,7 +112,9 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
    - `bottomk_min(k, q)` - returns bottom K time series with the min minimums on the given time range
    - `bottomk_max(k, q)` - returns bottom K time series with the min maximums on the given time range
    - `bottomk_avg(k, q)` - returns bottom K time series with the min averages on the given time range
-   - `bottomk_median(k, q)` - returns bottom K time series with the min medians on the given time range
+   - `bottomk_median(k, q)` - returns bottom K time series with the min medians on the given time range.
+
+  All the `topk_*` and `bottomk_*` functions accept optional third argument - label name for the sum of the remaining time series outside top K or bottom K time series. For example, `topk_max(3, process_resident_memory_bytes, "remaining_sum")` would return up to 3 time series with the maximum value for `process_resident_memory_bytes` plus fourth time series with the sum of the remaining time series if any. The fourth time series will contain `remaining_sum="remaining_sum"` additional label.
 - `share_le_over_time(m[d], le)` - returns share (in the range 0..1) of values in `m` over `d`, which are smaller or equal to `le`. Useful for calculating SLI and SLO.
   Example: `share_le_over_time(memory_usage_bytes[24h], 100*1024*1024)` returns the share of time series values for the last 24 hours when memory usage was below or equal to 100MB.
 - `share_gt_over_time(m[d], gt)` - returns share (in the range 0..1) of values in `m` over `d`, which are bigger than `gt`. Useful for calculating SLI and SLO.

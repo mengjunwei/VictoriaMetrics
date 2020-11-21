@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -389,8 +390,8 @@ func TestStorageOpenMultipleTimes(t *testing.T) {
 
 func TestStorageRandTimestamps(t *testing.T) {
 	path := "TestStorageRandTimestamps"
-	retentionMonths := 60
-	s, err := OpenStorage(path, retentionMonths)
+	retentionMsecs := int64(60 * msecsPerMonth)
+	s, err := OpenStorage(path, retentionMsecs)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
 	}
@@ -400,7 +401,7 @@ func TestStorageRandTimestamps(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.MustClose()
-			s, err = OpenStorage(path, retentionMonths)
+			s, err = OpenStorage(path, retentionMsecs)
 		}
 	})
 	t.Run("concurrent", func(t *testing.T) {
@@ -597,7 +598,7 @@ func testStorageDeleteMetrics(s *Storage, workerNum int) error {
 			return fmt.Errorf("unexpected error when adding mrs: %w", err)
 		}
 	}
-	s.debugFlush()
+	s.DebugFlush()
 
 	// Verify tag values exist
 	tvs, err := s.SearchTagValues(accountID, projectID, workerTag, 1e5, noDeadline)
@@ -701,6 +702,220 @@ func checkTagKeys(tks []string, tksExpected map[string]bool) error {
 			return fmt.Errorf("cannot find %q in tag keys %q", k, tks)
 		}
 	}
+	return nil
+}
+
+func TestStorageRegisterMetricNamesSerial(t *testing.T) {
+	path := "TestStorageRegisterMetricNamesSerial"
+	s, err := OpenStorage(path, 0)
+	if err != nil {
+		t.Fatalf("cannot open storage: %s", err)
+	}
+	if err := testStorageRegisterMetricNames(s); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	s.MustClose()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+}
+
+func TestStorageRegisterMetricNamesConcurrent(t *testing.T) {
+	path := "TestStorageRegisterMetricNamesConcurrent"
+	s, err := OpenStorage(path, 0)
+	if err != nil {
+		t.Fatalf("cannot open storage: %s", err)
+	}
+	ch := make(chan error, 3)
+	for i := 0; i < cap(ch); i++ {
+		go func() {
+			ch <- testStorageRegisterMetricNames(s)
+		}()
+	}
+	for i := 0; i < cap(ch); i++ {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timeout")
+		}
+	}
+	s.MustClose()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatalf("cannot remove %q: %s", path, err)
+	}
+}
+
+func testStorageRegisterMetricNames(s *Storage) error {
+	const metricsPerAdd = 1e3
+	const addsCount = 10
+	const accountID = 123
+	const projectID = 421
+
+	addIDsMap := make(map[string]struct{})
+	for i := 0; i < addsCount; i++ {
+		var mrs []MetricRow
+		var mn MetricName
+		addID := fmt.Sprintf("%d", i)
+		addIDsMap[addID] = struct{}{}
+		mn.AccountID = accountID
+		mn.ProjectID = projectID
+		mn.Tags = []Tag{
+			{[]byte("job"), []byte("webservice")},
+			{[]byte("instance"), []byte("1.2.3.4")},
+			{[]byte("add_id"), []byte(addID)},
+		}
+		now := timestampFromTime(time.Now())
+		for j := 0; j < metricsPerAdd; j++ {
+			mn.MetricGroup = []byte(fmt.Sprintf("metric_%d", j))
+			metricNameRaw := mn.marshalRaw(nil)
+
+			mr := MetricRow{
+				MetricNameRaw: metricNameRaw,
+				Timestamp:     now,
+			}
+			mrs = append(mrs, mr)
+		}
+		if err := s.RegisterMetricNames(mrs); err != nil {
+			return fmt.Errorf("unexpected error in AddMetrics: %w", err)
+		}
+	}
+	var addIDsExpected []string
+	for k := range addIDsMap {
+		addIDsExpected = append(addIDsExpected, k)
+	}
+	sort.Strings(addIDsExpected)
+
+	// Verify the storage contains the added metric names.
+	s.DebugFlush()
+
+	// Verify that SearchTagKeys returns correct result.
+	tksExpected := []string{
+		"",
+		"add_id",
+		"instance",
+		"job",
+	}
+	tks, err := s.SearchTagKeys(accountID, projectID, 100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeys: %w", err)
+	}
+	sort.Strings(tks)
+	if !reflect.DeepEqual(tks, tksExpected) {
+		return fmt.Errorf("unexpected tag keys returned from SearchTagKeys;\ngot\n%q\nwant\n%q", tks, tksExpected)
+	}
+
+	// Verify that SearchTagKeys returns empty results for incorrect accountID, projectID
+	tks, err = s.SearchTagKeys(accountID+1, projectID+1, 100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeys for incorrect accountID, projectID: %w", err)
+	}
+	if len(tks) > 0 {
+		return fmt.Errorf("SearchTagKeys with incorrect accountID, projectID returns unexpected non-empty result:\n%q", tks)
+	}
+
+	// Verify that SearchTagKeysOnTimeRange returns correct result.
+	now := timestampFromTime(time.Now())
+	start := now - msecPerDay
+	end := now + 60*1000
+	tr := TimeRange{
+		MinTimestamp: start,
+		MaxTimestamp: end,
+	}
+	tks, err = s.SearchTagKeysOnTimeRange(accountID, projectID, tr, 100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeysOnTimeRange: %w", err)
+	}
+	sort.Strings(tks)
+	if !reflect.DeepEqual(tks, tksExpected) {
+		return fmt.Errorf("unexpected tag keys returned from SearchTagKeysOnTimeRange;\ngot\n%q\nwant\n%q", tks, tksExpected)
+	}
+
+	// Verify that SearchTagKeysOnTimeRange returns empty results for incrorrect accountID, projectID
+	tks, err = s.SearchTagKeysOnTimeRange(accountID+1, projectID+1, tr, 100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagKeysOnTimeRange for incorrect accountID, projectID: %w", err)
+	}
+	if len(tks) > 0 {
+		return fmt.Errorf("SearchTagKeysOnTimeRange with incorrect accountID, projectID returns unexpected non-empty result:\n%q", tks)
+	}
+
+	// Verify that SearchTagValues returns correct result.
+	addIDs, err := s.SearchTagValues(accountID, projectID, []byte("add_id"), addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValues: %w", err)
+	}
+	sort.Strings(addIDs)
+	if !reflect.DeepEqual(addIDs, addIDsExpected) {
+		return fmt.Errorf("unexpected tag values returned from SearchTagValues;\ngot\n%q\nwant\n%q", addIDs, addIDsExpected)
+	}
+
+	// Verify that SearchTagValues return empty results for incorrect accountID, projectID
+	addIDs, err = s.SearchTagValues(accountID+1, projectID+1, []byte("add_id"), addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValues for incorrect accountID, projectID: %w", err)
+	}
+	if len(addIDs) > 0 {
+		return fmt.Errorf("SearchTagValues with incorrect accountID, projectID returns unexpected non-empty result:\n%q", addIDs)
+	}
+
+	// Verify that SearchTagValuesOnTimeRange returns correct result.
+	addIDs, err = s.SearchTagValuesOnTimeRange(accountID, projectID, []byte("add_id"), tr, addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValuesOnTimeRange: %w", err)
+	}
+	sort.Strings(addIDs)
+	if !reflect.DeepEqual(addIDs, addIDsExpected) {
+		return fmt.Errorf("unexpected tag values returned from SearchTagValuesOnTimeRange;\ngot\n%q\nwant\n%q", addIDs, addIDsExpected)
+	}
+
+	// Verify that SearchTagValuesOnTimeRange returns empty results for incorrect accountID, projectID
+	addIDs, err = s.SearchTagValuesOnTimeRange(accountID+1, projectID+1, []byte("addd_id"), tr, addsCount+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchTagValuesOnTimeRange for incorrect accoundID, projectID: %w", err)
+	}
+	if len(addIDs) > 0 {
+		return fmt.Errorf("SearchTagValuesOnTimeRange with incorrect accountID, projectID returns unexpected non-empty result:\n%q", addIDs)
+	}
+
+	// Verify that SearchMetricNames returns correct result.
+	tfs := NewTagFilters(accountID, projectID)
+	if err := tfs.Add([]byte("add_id"), []byte("0"), false, false); err != nil {
+		return fmt.Errorf("unexpected error in TagFilters.Add: %w", err)
+	}
+	mns, err := s.SearchMetricNames([]*TagFilters{tfs}, tr, metricsPerAdd*addsCount*100+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchMetricNames: %w", err)
+	}
+	if len(mns) < metricsPerAdd {
+		return fmt.Errorf("unexpected number of metricNames returned from SearchMetricNames; got %d; want at least %d", len(mns), int(metricsPerAdd))
+	}
+	for i, mn := range mns {
+		addID := mn.GetTagValue("add_id")
+		if string(addID) != "0" {
+			return fmt.Errorf("unexpected addID for metricName #%d; got %q; want %q", i, addID, "0")
+		}
+		job := mn.GetTagValue("job")
+		if string(job) != "webservice" {
+			return fmt.Errorf("unexpected job for metricName #%d; got %q; want %q", i, job, "webservice")
+		}
+	}
+
+	// Verify that SearchMetricNames returns empty results for incorrect accountID, projectID
+	tfs = NewTagFilters(accountID+1, projectID+1)
+	if err := tfs.Add([]byte("add_id"), []byte("0"), false, false); err != nil {
+		return fmt.Errorf("unexpected error in TagFilters.Add: %w", err)
+	}
+	mns, err = s.SearchMetricNames([]*TagFilters{tfs}, tr, metricsPerAdd*addsCount*100+100, noDeadline)
+	if err != nil {
+		return fmt.Errorf("error in SearchMetricNames for incorrect accountID, projectID: %w", err)
+	}
+	if len(mns) > 0 {
+		return fmt.Errorf("SearchMetricNames with incorrect accountID, projectID returns unexpected non-empty result:\n%+v", mns)
+	}
+
 	return nil
 }
 

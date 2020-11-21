@@ -209,6 +209,16 @@ func selectHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 			return true
 		}
 	}
+	if strings.HasPrefix(p.Suffix, "graphite/tags/") && !isGraphiteTagsPath(p.Suffix[len("graphite"):]) {
+		tagName := p.Suffix[len("graphite/tags/"):]
+		graphiteTagValuesRequests.Inc()
+		if err := graphite.TagValuesHandler(startTime, at, tagName, w, r); err != nil {
+			graphiteTagValuesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	}
 
 	switch p.Suffix {
 	case "prometheus/api/v1/query":
@@ -336,22 +346,56 @@ func selectHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 			return true
 		}
 		return true
+	case "graphite/tags":
+		graphiteTagsRequests.Inc()
+		if err := graphite.TagsHandler(startTime, at, w, r); err != nil {
+			graphiteTagsErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	case "graphite/tags/findSeries":
+		graphiteTagsFindSeriesRequests.Inc()
+		if err := graphite.TagsFindSeriesHandler(startTime, at, w, r); err != nil {
+			graphiteTagsFindSeriesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	case "graphite/tags/autoComplete/tags":
+		graphiteTagsAutoCompleteTagsRequests.Inc()
+		httpserver.EnableCORS(w, r)
+		if err := graphite.TagsAutoCompleteTagsHandler(startTime, at, w, r); err != nil {
+			graphiteTagsAutoCompleteTagsErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	case "graphite/tags/autoComplete/values":
+		graphiteTagsAutoCompleteValuesRequests.Inc()
+		httpserver.EnableCORS(w, r)
+		if err := graphite.TagsAutoCompleteValuesHandler(startTime, at, w, r); err != nil {
+			graphiteTagsAutoCompleteValuesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
 	case "prometheus/api/v1/rules":
 		// Return dumb placeholder
 		rulesRequests.Inc()
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		fmt.Fprintf(w, "%s", `{"status":"success","data":{"groups":[]}}`)
 		return true
 	case "prometheus/api/v1/alerts":
 		// Return dumb placehloder
 		alertsRequests.Inc()
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		fmt.Fprintf(w, "%s", `{"status":"success","data":{"alerts":[]}}`)
 		return true
 	case "prometheus/api/v1/metadata":
 		// Return dumb placeholder
 		metadataRequests.Inc()
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		fmt.Fprintf(w, "%s", `{"status":"success","data":{}}`)
 		return true
 	default:
@@ -375,10 +419,22 @@ func deleteHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+func isGraphiteTagsPath(path string) bool {
+	switch path {
+	// See https://graphite.readthedocs.io/en/stable/tags.html for a list of Graphite Tags API paths.
+	// Do not include `/tags/<tag_name>` here, since this will fool the caller.
+	case "/tags/tagSeries", "/tags/tagMultiSeries", "/tags/findSeries",
+		"/tags/autoComplete/tags", "/tags/autoComplete/values", "/tags/delSeries":
+		return true
+	default:
+		return false
+	}
+}
+
 func sendPrometheusError(w http.ResponseWriter, r *http.Request, err error) {
 	logger.Warnf("error in %q: %s", r.RequestURI, err)
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	statusCode := http.StatusUnprocessableEntity
 	var esc *httpserver.ErrorWithStatusCode
 	if errors.As(err, &esc) {
@@ -438,6 +494,21 @@ var (
 
 	graphiteMetricsIndexRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/metrics/index.json"}`)
 	graphiteMetricsIndexErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/metrics/index.json"}`)
+
+	graphiteTagsRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags"}`)
+	graphiteTagsErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags"}`)
+
+	graphiteTagValuesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/<tag_name>"}`)
+	graphiteTagValuesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/<tag_name>"}`)
+
+	graphiteTagsFindSeriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/findSeries"}`)
+	graphiteTagsFindSeriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/findSeries"}`)
+
+	graphiteTagsAutoCompleteTagsRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/autoComplete/tags"}`)
+	graphiteTagsAutoCompleteTagsErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/autoComplete/tags"}`)
+
+	graphiteTagsAutoCompleteValuesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/autoComplete/values"}`)
+	graphiteTagsAutoCompleteValuesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/autoComplete/values"}`)
 
 	rulesRequests    = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/rules"}`)
 	alertsRequests   = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/alerts"}`)
