@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
 // SDConfig represents service discovery config for Consul.
@@ -16,6 +17,7 @@ type SDConfig struct {
 	Scheme       string              `yaml:"scheme,omitempty"`
 	Username     string              `yaml:"username"`
 	Password     string              `yaml:"password"`
+	ProxyURL     proxy.URL           `yaml:"proxy_url,omitempty"`
 	TLSConfig    *promauth.TLSConfig `yaml:"tls_config,omitempty"`
 	Services     []string            `yaml:"services,omitempty"`
 	Tags         []string            `yaml:"tags,omitempty"`
@@ -32,9 +34,6 @@ func GetLabels(sdc *SDConfig, baseDir string) ([]map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot get API config: %w", err)
 	}
-	ms, err := getServiceNodesLabels(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("error when fetching service nodes data from Consul: %w", err)
-	}
+	ms := getServiceNodesLabels(cfg)
 	return ms, nil
 }

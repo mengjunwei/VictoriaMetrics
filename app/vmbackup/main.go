@@ -12,7 +12,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fslocal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/fsnil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -20,7 +19,7 @@ import (
 
 var (
 	storageDataPath   = flag.String("storageDataPath", "victoria-metrics-data", "Path to VictoriaMetrics data. Must match -storageDataPath from VictoriaMetrics or vmstorage")
-	snapshotName      = flag.String("snapshotName", "", "Name for the snapshot to backup. See https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/README.md#how-to-work-with-snapshots")
+	snapshotName      = flag.String("snapshotName", "", "Name for the snapshot to backup. See https://victoriametrics.github.io/Single-server-VictoriaMetrics.html#how-to-work-with-snapshots")
 	snapshotCreateURL = flag.String("snapshot.createURL", "", "VictoriaMetrics create snapshot url. When this is given a snapshot will automatically be created during backup. "+
 		"Example: http://victoriametrics:8428/snaphsot/create")
 	snapshotDeleteURL = flag.String("snapshot.deleteURL", "", "VictoriaMetrics delete snapshot url. Optional. Will be generated from -snapshot.createURL if not provided. "+
@@ -40,10 +39,9 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	cgroup.UpdateGOMAXPROCSToCPUQuota()
 
 	if len(*snapshotCreateURL) > 0 {
-		logger.Infof("%s", "Snapshots enabled")
+		logger.Infof("Snapshots enabled")
 		logger.Infof("Snapshot create url %s", *snapshotCreateURL)
 		if len(*snapshotDeleteURL) <= 0 {
 			err := flag.Set("snapshot.deleteURL", strings.Replace(*snapshotCreateURL, "/create", "/delete", 1))
@@ -55,17 +53,17 @@ func main() {
 
 		name, err := snapshot.Create(*snapshotCreateURL)
 		if err != nil {
-			logger.Fatalf("%s", err)
+			logger.Fatalf("cannot create snapshot: %s", err)
 		}
 		err = flag.Set("snapshotName", name)
 		if err != nil {
-			logger.Fatalf("Failed to set snapshotName flag: %v", err)
+			logger.Fatalf("cannot set snapshotName flag: %v", err)
 		}
 
 		defer func() {
 			err := snapshot.Delete(*snapshotDeleteURL, name)
 			if err != nil {
-				logger.Fatalf("%s", err)
+				logger.Fatalf("cannot delete snapshot: %s", err)
 			}
 		}()
 	}
@@ -101,12 +99,9 @@ func usage() {
 vmbackup performs backups for VictoriaMetrics data from instant snapshots to gcs, s3
 or local filesystem. Backed up data can be restored with vmrestore.
 
-See the docs at https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmbackup/README.md .
+See the docs at https://victoriametrics.github.io/vbackup.html .
 `
-
-	f := flag.CommandLine.Output()
-	fmt.Fprintf(f, "%s\n", s)
-	flag.PrintDefaults()
+	flagutil.Usage(s)
 }
 
 func newSrcFS() (*fslocal.FS, error) {

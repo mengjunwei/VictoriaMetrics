@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type lexer struct {
@@ -149,8 +151,14 @@ func scanString(s string) (string, error) {
 func scanPositiveNumber(s string) (string, error) {
 	// Scan integer part. It may be empty if fractional part exists.
 	i := 0
-	if n := scanSpecialIntegerPrefix(s); n > 0 {
-		i += n
+	skipChars, isHex := scanSpecialIntegerPrefix(s)
+	i += skipChars
+	if isHex {
+		// Scan integer hex number
+		for i < len(s) && isHexChar(s[i]) {
+			i++
+		}
+		return s[:i], nil
 	}
 	for i < len(s) && isDecimalChar(s[i]) {
 		i++
@@ -214,13 +222,12 @@ func scanIdent(s string) string {
 		if s[i] != '\\' {
 			break
 		}
+		i++
 
 		// Do not verify the next char, since it is escaped.
-		i += 2
-		if i > len(s) {
-			i--
-			break
-		}
+		// The next char may be encoded as multi-byte UTF8 sequence. See https://en.wikipedia.org/wiki/UTF-8#Encoding
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
 	}
 	if i == 0 {
 		panic("BUG: scanIdent couldn't find a single ident char; make sure isIdentPrefix called before scanIdent")
@@ -251,8 +258,10 @@ func unescapeIdent(s string) string {
 				s = s[1:]
 			}
 		} else {
-			dst = append(dst, s[0])
-			s = s[1:]
+			// UTF8 char. See https://en.wikipedia.org/wiki/UTF-8#Encoding
+			_, size := utf8.DecodeRuneInString(s)
+			dst = append(dst, s[:size]...)
+			s = s[size:]
 		}
 		n = strings.IndexByte(s, '\\')
 		if n < 0 {
@@ -292,12 +301,18 @@ func appendEscapedIdent(dst []byte, s string) []byte {
 			} else {
 				dst = append(dst, ch)
 			}
-		} else if ch >= 0x20 && ch < 0x7f {
-			// Leave ASCII printable chars as is
-			dst = append(dst, '\\', ch)
+			continue
+		}
+
+		// escape ch
+		dst = append(dst, '\\')
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r != utf8.RuneError && unicode.IsPrint(r) {
+			dst = append(dst, s[i:i+size]...)
+			i += size - 1
 		} else {
 			// hex-encode non-printable chars
-			dst = append(dst, '\\', 'x', toHex(ch>>4), toHex(ch&0xf))
+			dst = append(dst, 'x', toHex(ch>>4), toHex(ch&0xf))
 		}
 	}
 	return dst
@@ -370,26 +385,31 @@ func isPositiveNumberPrefix(s string) bool {
 }
 
 func isSpecialIntegerPrefix(s string) bool {
-	return scanSpecialIntegerPrefix(s) > 0
+	skipChars, _ := scanSpecialIntegerPrefix(s)
+	return skipChars > 0
 }
 
-func scanSpecialIntegerPrefix(s string) int {
+func scanSpecialIntegerPrefix(s string) (skipChars int, isHex bool) {
 	if len(s) < 1 || s[0] != '0' {
-		return 0
+		return 0, false
 	}
 	s = strings.ToLower(s[1:])
 	if len(s) == 0 {
-		return 0
+		return 0, false
 	}
 	if isDecimalChar(s[0]) {
 		// octal number: 0123
-		return 1
+		return 1, false
 	}
-	if s[0] == 'x' || s[0] == 'o' || s[0] == 'b' {
+	if s[0] == 'x' {
+		// 0x
+		return 2, true
+	}
+	if s[0] == 'o' || s[0] == 'b' {
 		// 0x, 0o or 0b prefix
-		return 2
+		return 2, false
 	}
-	return 0
+	return 0, false
 }
 
 func isPositiveDuration(s string) bool {
@@ -397,8 +417,12 @@ func isPositiveDuration(s string) bool {
 	return n == len(s)
 }
 
-// PositiveDurationValue returns the duration in milliseconds for the given s
+// PositiveDurationValue returns positive duration in milliseconds for the given s
 // and the given step.
+//
+// Duration in s may be combined, i.e. 2h5m or 2h-5m.
+//
+// Error is returned if the duration in s is negative.
 func PositiveDurationValue(s string, step int64) (int64, error) {
 	d, err := DurationValue(s, step)
 	if err != nil {
@@ -413,7 +437,7 @@ func PositiveDurationValue(s string, step int64) (int64, error) {
 // DurationValue returns the duration in milliseconds for the given s
 // and the given step.
 //
-// Duration in s may be combined, i.e. 2h5m or 2h-5m.
+// Duration in s may be combined, i.e. 2h5m, -2h5m or 2h-5m.
 //
 // The returned duration value can be negative.
 func DurationValue(s string, step int64) (int64, error) {
@@ -421,6 +445,7 @@ func DurationValue(s string, step int64) (int64, error) {
 		return 0, fmt.Errorf("duration cannot be empty")
 	}
 	var d int64
+	isMinus := false
 	for len(s) > 0 {
 		n := scanSingleDuration(s, true)
 		if n <= 0 {
@@ -432,7 +457,13 @@ func DurationValue(s string, step int64) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if isMinus && dLocal > 0 {
+			dLocal = -dLocal
+		}
 		d += dLocal
+		if dLocal < 0 {
+			isMinus = true
+		}
 	}
 	return d, nil
 }
@@ -534,6 +565,10 @@ func scanSingleDuration(s string, canBeNegative bool) int {
 
 func isDecimalChar(ch byte) bool {
 	return ch >= '0' && ch <= '9'
+}
+
+func isHexChar(ch byte) bool {
+	return isDecimalChar(ch) || ch >= 'a' && ch <= 'f' || ch >= 'A' && ch <= 'F'
 }
 
 func isIdentPrefix(s string) bool {

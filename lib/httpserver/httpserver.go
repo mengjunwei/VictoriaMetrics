@@ -89,7 +89,9 @@ func Serve(addr string, rh RequestHandler) {
 			logger.Fatalf("cannot load TLS cert from tlsCertFile=%q, tlsKeyFile=%q: %s", *tlsCertFile, *tlsKeyFile, err)
 		}
 		cfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
+			Certificates:             []tls.Certificate{cert},
+			MinVersion:               tls.VersionTLS12,
+			PreferServerCipherSuites: true,
 		}
 		ln = tls.NewListener(ln, cfg)
 	}
@@ -258,8 +260,11 @@ func handlerWrapper(s *server, w http.ResponseWriter, r *http.Request, rh Reques
 }
 
 func getCanonicalPath(path string) (string, error) {
-	if len(*pathPrefix) == 0 {
+	if len(*pathPrefix) == 0 || path == "/" {
 		return path, nil
+	}
+	if *pathPrefix == path {
+		return "/", nil
 	}
 	prefix := *pathPrefix
 	if !strings.HasSuffix(prefix, "/") {
@@ -542,4 +547,9 @@ func isTrivialNetworkError(err error) bool {
 // IsTLS indicates is tls enabled or not
 func IsTLS() bool {
 	return *tlsEnable
+}
+
+// GetPathPrefix - returns http server path prefix.
+func GetPathPrefix() string {
+	return *pathPrefix
 }

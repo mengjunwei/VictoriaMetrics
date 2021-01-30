@@ -451,6 +451,12 @@ func InitStorageNodes(addrs []string) {
 			sn.brLock.Unlock()
 			return float64(n)
 		})
+		_ = metrics.NewGauge(fmt.Sprintf(`vm_rpc_vmstorage_is_reachable{name="vminsert", addr=%q}`, addr), func() float64 {
+			if sn.isBroken() {
+				return 0
+			}
+			return 1
+		})
 		storageNodes = append(storageNodes, sn)
 	}
 
@@ -579,7 +585,9 @@ func getHealthyStorageNodesBlocking(stopCh <-chan struct{}) []*storageNode {
 func spreadReroutedBufToStorageNodesBlocking(stopCh <-chan struct{}, br *bufRows) {
 	var mr storage.MetricRow
 	rowsProcessed := 0
-	defer reroutedRowsProcessed.Add(rowsProcessed)
+	defer func() {
+		reroutedRowsProcessed.Add(rowsProcessed)
+	}()
 
 	sns := getHealthyStorageNodesBlocking(stopCh)
 	if len(sns) == 0 {

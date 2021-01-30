@@ -6,7 +6,7 @@ rules against configured address.
 
 ### Features:
 * Integration with [VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics) TSDB;
-* VictoriaMetrics [MetricsQL](https://github.com/VictoriaMetrics/VictoriaMetrics/wiki/MetricsQL)
+* VictoriaMetrics [MetricsQL](https://victoriametrics.github.io/MetricsQL.html)
  support and expressions validation;
 * Prometheus [alerting rules definition format](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/#defining-alerting-rules)
  support;
@@ -21,7 +21,6 @@ may fail;
 * by default, rules execution is sequential within one group, but persisting of execution results to remote
 storage is asynchronous. Hence, user shouldn't rely on recording rules chaining when result of previous
 recording rule is reused in next one;
-* there is no `query` function support in templates yet;
 * `vmalert` has no UI, just an API for getting groups and rules statuses.
 
 ### QuickStart
@@ -90,7 +89,7 @@ rules:
 
 There are two types of Rules:
 * [alerting](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) - 
-Alerting rules allows to define alert conditions via [MetricsQL](https://github.com/VictoriaMetrics/VictoriaMetrics/wiki/MetricsQL)
+Alerting rules allows to define alert conditions via [MetricsQL](https://victoriametrics.github.io/MetricsQL.html)
 and to send notifications about firing alerts to [Alertmanager](https://github.com/prometheus/alertmanager).
 * [recording](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/) - 
 Recording rules allow you to precompute frequently needed or computationally expensive expressions 
@@ -176,9 +175,9 @@ The shortlist of configuration flags is the following:
   -datasource.basicAuth.username string
     	Optional basic auth username for -datasource.url
   -datasource.lookback duration
-        Lookback defines how far to look into past when evaluating queries. For example, if datasource.lookback=5m then param "time" with value now()-5m will be added to every query.
+    	Lookback defines how far to look into past when evaluating queries. For example, if datasource.lookback=5m then param "time" with value now()-5m will be added to every query.
   -datasource.maxIdleConnections int
-        Defines the number of idle (keep-alive connections) to configured datasource.Consider to set this value equal to the value: groups_total * group.concurrency. Too low value may result into high number of sockets in TIME_WAIT state. (default 100)
+    	Defines the number of idle (keep-alive connections) to configured datasource.Consider to set this value equal to the value: groups_total * group.concurrency. Too low value may result into high number of sockets in TIME_WAIT state. (default 100)
   -datasource.tlsCAFile string
     	Optional path to TLS CA file to use for verifying connections to -datasource.url. By default system CA is used
   -datasource.tlsCertFile string
@@ -191,6 +190,8 @@ The shortlist of configuration flags is the following:
     	Optional TLS server name to use for connections to -datasource.url. By default the server name from -datasource.url is used
   -datasource.url string
     	Victoria Metrics or VMSelect url. Required parameter. E.g. http://127.0.0.1:8428
+  -dryRun -rule
+    	Whether to check only config files without running vmalert. The rules file are validated. The -rule flag must be specified.
   -enableTCP6
     	Whether to enable IPv6 for listening and dialing. By default only IPv4 TCP is used
   -envflag.enable
@@ -201,7 +202,7 @@ The shortlist of configuration flags is the following:
     	How often to evaluate the rules (default 1m0s)
   -external.alert.source string
     	External Alert Source allows to override the Source link for alerts sent to AlertManager for cases where you want to build a custom link to Grafana, Prometheus or any other service.
-    	eg. 'explore?orgId=1&left=[\"now-1h\",\"now\",\"VictoriaMetrics\",{\"expr\": \"{{$expr|quotesEscape|pathEscape}}\"},{\"mode\":\"Metrics\"},{\"ui\":[true,true,true,\"none\"]}]'.If empty '/api/v1/:groupID/alertID/status' is used
+    	eg. 'explore?orgId=1&left=[\"now-1h\",\"now\",\"VictoriaMetrics\",{\"expr\": \"{{$expr|quotesEscape|crlfEscape|pathEscape}}\"},{\"mode\":\"Metrics\"},{\"ui\":[true,true,true,\"none\"]}]'.If empty '/api/v1/:groupID/alertID/status' is used
   -external.label array
     	Optional label in the form 'name=value' to add to all generated recording rules and alerts. Pass multiple -label flags in order to add multiple label sets.
     	Supports array of values separated by comma or specified via multiple flags.
@@ -225,14 +226,18 @@ The shortlist of configuration flags is the following:
     	Username for HTTP Basic Auth. The authentication is disabled if empty. See also -httpAuth.password
   -httpListenAddr string
     	Address to listen for http connections (default ":8880")
+  -loggerDisableTimestamps
+    	Whether to disable writing timestamps in logs
   -loggerErrorsPerSecondLimit int
-    	Per-second limit on the number of ERROR messages. If more than the given number of errors are emitted per second, then the remaining errors are suppressed. Zero value disables the rate limit (default 10)
+    	Per-second limit on the number of ERROR messages. If more than the given number of errors are emitted per second, then the remaining errors are suppressed. Zero value disables the rate limit
   -loggerFormat string
     	Format for logs. Possible values: default, json (default "default")
   -loggerLevel string
     	Minimum level of errors to log. Possible values: INFO, WARN, ERROR, FATAL, PANIC (default "INFO")
   -loggerOutput string
     	Output for the logs. Supported values: stderr, stdout (default "stderr")
+  -loggerWarnsPerSecondLimit int
+    	Per-second limit on the number of WARN messages. If more than the given number of warns are emitted per second, then the remaining warns are suppressed. Zero value disables the rate limit
   -memory.allowedBytes value
     	Allowed size of system memory VictoriaMetrics caches may occupy. This option overrides -memory.allowedPercent if set to non-zero value. Too low value may increase cache miss rate, which usually results in higher CPU and disk IO usage. Too high value may evict too much data from OS page cache, which will result in higher disk IO usage
     	Supports the following optional suffixes for values: KB, MB, GB, KiB, MiB, GiB (default 0)
@@ -241,10 +246,10 @@ The shortlist of configuration flags is the following:
   -metricsAuthKey string
     	Auth key for /metrics. It overrides httpAuth settings
   -notifier.basicAuth.password array
-    	Optional basic auth password for -datasource.url
+    	Optional basic auth password for -notifier.url
     	Supports array of values separated by comma or specified via multiple flags.
   -notifier.basicAuth.username array
-    	Optional basic auth username for -datasource.url
+    	Optional basic auth username for -notifier.url
     	Supports array of values separated by comma or specified via multiple flags.
   -notifier.tlsCAFile array
     	Optional path to TLS CA file to use for verifying connections to -notifier.url. By default system CA is used
@@ -252,8 +257,9 @@ The shortlist of configuration flags is the following:
   -notifier.tlsCertFile array
     	Optional path to client-side TLS certificate file to use when connecting to -notifier.url
     	Supports array of values separated by comma or specified via multiple flags.
-  -notifier.tlsInsecureSkipVerify
+  -notifier.tlsInsecureSkipVerify array
     	Whether to skip tls verification when connecting to -notifier.url
+    	Supports array of values separated by comma or specified via multiple flags.
   -notifier.tlsKeyFile array
     	Optional path to client-side TLS certificate key to use when connecting to -notifier.url
     	Supports array of values separated by comma or specified via multiple flags.

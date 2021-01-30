@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -44,7 +43,7 @@ var (
 )
 
 func getDefaultMaxConcurrentRequests() int {
-	n := runtime.GOMAXPROCS(-1)
+	n := cgroup.AvailableCPUs()
 	if n <= 4 {
 		n *= 2
 	}
@@ -60,10 +59,10 @@ func getDefaultMaxConcurrentRequests() int {
 func main() {
 	// Write flags and help message to stdout, since it is easier to grep or pipe.
 	flag.CommandLine.SetOutput(os.Stdout)
+	flag.Usage = usage
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	cgroup.UpdateGOMAXPROCSToCPUQuota()
 
 	logger.Infof("starting netstorage at storageNodes %s", *storageNodes)
 	startTime := time.Now()
@@ -127,7 +126,7 @@ var (
 )
 
 func requestHandler(w http.ResponseWriter, r *http.Request) bool {
-	if r.RequestURI == "/" {
+	if r.URL.Path == "/" {
 		fmt.Fprintf(w, "vmselect - a component of VictoriaMetrics cluster. See docs at https://victoriametrics.github.io/Cluster-VictoriaMetrics.html")
 		return true
 	}
@@ -170,6 +169,15 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		promql.ResetRollupResultCache()
+		return true
+	}
+	if path == "/api/v1/status/top_queries" {
+		globalTopQueriesRequests.Inc()
+		if err := prometheus.QueryStatsHandler(startTime, nil, w, r); err != nil {
+			globalTopQueriesErrors.Inc()
+			sendPrometheusError(w, r, err)
+			return true
+		}
 		return true
 	}
 
@@ -287,6 +295,14 @@ func selectHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 		statusActiveQueriesRequests.Inc()
 		promql.WriteActiveQueries(w)
 		return true
+	case "prometheus/api/v1/status/top_queries":
+		topQueriesRequests.Inc()
+		if err := prometheus.QueryStatsHandler(startTime, at, w, r); err != nil {
+			topQueriesErrors.Inc()
+			sendPrometheusError(w, r, err)
+			return true
+		}
+		return true
 	case "prometheus/api/v1/export":
 		exportRequests.Inc()
 		if err := prometheus.ExportHandler(startTime, at, w, r); err != nil {
@@ -346,6 +362,22 @@ func selectHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 			return true
 		}
 		return true
+	case "graphite/tags/tagSeries":
+		graphiteTagsTagSeriesRequests.Inc()
+		if err := graphite.TagsTagSeriesHandler(startTime, at, w, r); err != nil {
+			graphiteTagsTagSeriesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	case "graphite/tags/tagMultiSeries":
+		graphiteTagsTagMultiSeriesRequests.Inc()
+		if err := graphite.TagsTagMultiSeriesHandler(startTime, at, w, r); err != nil {
+			graphiteTagsTagMultiSeriesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
 	case "graphite/tags":
 		graphiteTagsRequests.Inc()
 		if err := graphite.TagsHandler(startTime, at, w, r); err != nil {
@@ -376,6 +408,14 @@ func selectHandler(startTime time.Time, w http.ResponseWriter, r *http.Request, 
 		httpserver.EnableCORS(w, r)
 		if err := graphite.TagsAutoCompleteValuesHandler(startTime, at, w, r); err != nil {
 			graphiteTagsAutoCompleteValuesErrors.Inc()
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
+			return true
+		}
+		return true
+	case "graphite/tags/delSeries":
+		graphiteTagsDelSeriesRequests.Inc()
+		if err := graphite.TagsDelSeriesHandler(startTime, at, w, r); err != nil {
+			graphiteTagsDelSeriesErrors.Inc()
 			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return true
 		}
@@ -471,6 +511,12 @@ var (
 
 	statusActiveQueriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}prometheus/api/v1/status/active_queries"}`)
 
+	topQueriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/status/top_queries"}`)
+	topQueriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/prometheus/api/v1/status/top_queries"}`)
+
+	globalTopQueriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/api/v1/status/top_queries"}`)
+	globalTopQueriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/api/v1/status/top_queries"}`)
+
 	deleteRequests = metrics.NewCounter(`vm_http_requests_total{path="/delete/{}/prometheus/api/v1/admin/tsdb/delete_series"}`)
 	deleteErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/delete/{}/prometheus/api/v1/admin/tsdb/delete_series"}`)
 
@@ -495,6 +541,12 @@ var (
 	graphiteMetricsIndexRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/metrics/index.json"}`)
 	graphiteMetricsIndexErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/metrics/index.json"}`)
 
+	graphiteTagsTagSeriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/tagSeries"}`)
+	graphiteTagsTagSeriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/tagSeries"}`)
+
+	graphiteTagsTagMultiSeriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/tagMultiSeries"}`)
+	graphiteTagsTagMultiSeriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/tagMultiSeries"}`)
+
 	graphiteTagsRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags"}`)
 	graphiteTagsErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags"}`)
 
@@ -510,7 +562,19 @@ var (
 	graphiteTagsAutoCompleteValuesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/autoComplete/values"}`)
 	graphiteTagsAutoCompleteValuesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/autoComplete/values"}`)
 
+	graphiteTagsDelSeriesRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/graphite/tags/delSeries"}`)
+	graphiteTagsDelSeriesErrors   = metrics.NewCounter(`vm_http_request_errors_total{path="/select/{}/graphite/tags/delSeries"}`)
+
 	rulesRequests    = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/rules"}`)
 	alertsRequests   = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/alerts"}`)
 	metadataRequests = metrics.NewCounter(`vm_http_requests_total{path="/select/{}/prometheus/api/v1/metadata"}`)
 )
+
+func usage() {
+	const s = `
+vmselect processes incoming queries by fetching the requested data from vmstorage nodes configured via -storageNode.
+
+See the docs at https://victoriametrics.github.io/Cluster-VictoriaMetrics.html .
+`
+	flagutil.Usage(s)
+}

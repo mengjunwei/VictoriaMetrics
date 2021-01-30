@@ -13,8 +13,145 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	graphiteparser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/graphite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
+)
+
+// TagsDelSeriesHandler implements /tags/delSeries handler.
+//
+// See https://graphite.readthedocs.io/en/stable/tags.html#removing-series-from-the-tagdb
+func TagsDelSeriesHandler(startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
+	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
+	paths := r.Form["path"]
+	totalDeleted := 0
+	var row graphiteparser.Row
+	var tagsPool []graphiteparser.Tag
+	ct := time.Now().UnixNano() / 1e6
+	for _, path := range paths {
+		var err error
+		tagsPool, err = row.UnmarshalMetricAndTags(path, tagsPool[:0])
+		if err != nil {
+			return fmt.Errorf("cannot parse path=%q: %w", path, err)
+		}
+		tfs := make([]storage.TagFilter, 0, 1+len(row.Tags))
+		tfs = append(tfs, storage.TagFilter{
+			Key:   nil,
+			Value: []byte(row.Metric),
+		})
+		for _, tag := range row.Tags {
+			tfs = append(tfs, storage.TagFilter{
+				Key:   []byte(tag.Key),
+				Value: []byte(tag.Value),
+			})
+		}
+		sq := storage.NewSearchQuery(at.AccountID, at.ProjectID, 0, ct, [][]storage.TagFilter{tfs})
+		n, err := netstorage.DeleteSeries(at, sq, deadline)
+		if err != nil {
+			return fmt.Errorf("cannot delete series for %q: %w", sq, err)
+		}
+		totalDeleted += n
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if totalDeleted > 0 {
+		fmt.Fprintf(w, "true")
+	} else {
+		fmt.Fprintf(w, "false")
+	}
+	return nil
+}
+
+// TagsTagSeriesHandler implements /tags/tagSeries handler.
+//
+// See https://graphite.readthedocs.io/en/stable/tags.html#adding-series-to-the-tagdb
+func TagsTagSeriesHandler(startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
+	return registerMetrics(startTime, at, w, r, false)
+}
+
+// TagsTagMultiSeriesHandler implements /tags/tagMultiSeries handler.
+//
+// See https://graphite.readthedocs.io/en/stable/tags.html#adding-series-to-the-tagdb
+func TagsTagMultiSeriesHandler(startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
+	return registerMetrics(startTime, at, w, r, true)
+}
+
+func registerMetrics(startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request, isJSONResponse bool) error {
+	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
+	paths := r.Form["path"]
+	var row graphiteparser.Row
+	var labels []prompb.Label
+	var b []byte
+	var tagsPool []graphiteparser.Tag
+	mrs := make([]storage.MetricRow, len(paths))
+	ct := time.Now().UnixNano() / 1e6
+	canonicalPaths := make([]string, len(paths))
+	for i, path := range paths {
+		var err error
+		tagsPool, err = row.UnmarshalMetricAndTags(path, tagsPool[:0])
+		if err != nil {
+			return fmt.Errorf("cannot parse path=%q: %w", path, err)
+		}
+
+		// Construct canonical path according to https://graphite.readthedocs.io/en/stable/tags.html#adding-series-to-the-tagdb
+		sort.Slice(row.Tags, func(i, j int) bool {
+			return row.Tags[i].Key < row.Tags[j].Key
+		})
+		b = append(b[:0], row.Metric...)
+		for _, tag := range row.Tags {
+			b = append(b, ';')
+			b = append(b, tag.Key...)
+			b = append(b, '=')
+			b = append(b, tag.Value...)
+		}
+		canonicalPaths[i] = string(b)
+
+		// Convert parsed metric and tags to labels.
+		labels = append(labels[:0], prompb.Label{
+			Name:  []byte("__name__"),
+			Value: []byte(row.Metric),
+		})
+		for _, tag := range row.Tags {
+			labels = append(labels, prompb.Label{
+				Name:  []byte(tag.Key),
+				Value: []byte(tag.Value),
+			})
+		}
+
+		// Put labels with the current timestamp to MetricRow
+		mr := &mrs[i]
+		mr.MetricNameRaw = storage.MarshalMetricNameRaw(mr.MetricNameRaw[:0], at.AccountID, at.ProjectID, labels)
+		mr.Timestamp = ct
+	}
+	if err := netstorage.RegisterMetricNames(at, mrs, deadline); err != nil {
+		return fmt.Errorf("cannot register paths: %w", err)
+	}
+
+	// Return response
+	contentType := "text/plain; charset=utf-8"
+	if isJSONResponse {
+		contentType = "application/json; charset=utf-8"
+	}
+	w.Header().Set("Content-Type", contentType)
+	WriteTagsTagMultiSeriesResponse(w, canonicalPaths, isJSONResponse)
+	if isJSONResponse {
+		tagsTagMultiSeriesDuration.UpdateDuration(startTime)
+	} else {
+		tagsTagSeriesDuration.UpdateDuration(startTime)
+	}
+	return nil
+}
+
+var (
+	tagsTagSeriesDuration      = metrics.NewSummary(`vm_request_duration_seconds{path="/tags/tagSeries"}`)
+	tagsTagMultiSeriesDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/tags/tagMultiSeries"}`)
 )
 
 // TagsAutoCompleteValuesHandler implements /tags/autoComplete/values endpoint from Graphite Tags API.

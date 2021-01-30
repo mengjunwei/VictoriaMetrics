@@ -57,6 +57,8 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
   - `alias(q, name)` for setting metric name across all the time series `q`.
   - `label_set(q, label1, value1, ... labelN, valueN)` for setting the given values for the given labels on `q`.
   - `label_map(q, label, srcValue1, dstValue1, ... srcValueN, dstValueN)` for mapping `label` values from `src*` to `dst*`.
+  - `label_uppercase(q, label1, ... labelN)` for uppercasing values for the given labels.
+  - `label_lowercase(q, label2, ... labelN)` for lowercasing value for the given labels.
   - `label_del(q, label1, ... labelN)` for deleting the given labels from `q`.
   - `label_keep(q, label1, ... labelN)` for deleting all the labels except the given labels from `q`.
   - `label_copy(q, src_label1, dst_label1, ... src_labelN, dst_labelN)` for copying label values from `src_*` to `dst_*`.
@@ -64,24 +66,24 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
   - `label_transform(q, label, regexp, replacement)` for replacing all the `regexp` occurences with `replacement` in the `label` values from `q`.
   - `label_value(q, label)` - returns numeric values for the given `label` from `q`.
 - `label_match(q, label, regexp)` and `label_mismatch(q, label, regexp)` for filtering time series with labels matching (or not matching) the given regexps.
-- `sort_by_label(q, label)` and `sort_by_label_desc(q, label)` for sorting time series by the given `label`.
+- `sort_by_label(q, label1, ... labelN)` and `sort_by_label_desc(q, label1, ... labelN)` for sorting time series by the given set of labels.
 - `step()` function for returning the step in seconds used in the query.
 - `start()` and `end()` functions for returning the start and end timestamps of the `[start ... end]` range used in the query.
 - `integrate(m[d])` for returning integral over the given duration `d` for the given metric `m`.
-- `ideriv(m)` - for calculating `instant` derivative for `m`.
+- `ideriv(m[d])` - for calculating `instant` derivative for the metric `m` over the duration `d`.
 - `deriv_fast(m[d])` - for calculating `fast` derivative for `m` based on the first and the last points from duration `d`.
 - `running_` functions - `running_sum`, `running_min`, `running_max`, `running_avg` - for calculating [running values](https://en.wikipedia.org/wiki/Running_total) on the selected time range.
 - `range_` functions - `range_sum`, `range_min`, `range_max`, `range_avg`, `range_first`, `range_last`, `range_median`, `range_quantile` - for calculating global value over the selected time range. Note that global value is based on calculated datapoints for the inner query. The calculated datapoints can differ from raw datapoints stored in the database. See [these docs](https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness) for details.
 - `smooth_exponential(q, sf)` - smooths `q` using [exponential moving average](https://en.wikipedia.org/wiki/Moving_average#Exponential_moving_average) with the given smooth factor `sf`.
 - `remove_resets(q)` - removes counter resets from `q`.
-- `lag(q[d])` - returns lag between the current timestamp and the timestamp from the previous data point in `q` over `d`.
-- `lifetime(q[d])` - returns lifetime of `q` over `d` in seconds. It is expected that `d` exceeds the lifetime of `q`.
-- `scrape_interval(q[d])` - returns the average interval in seconds between data points of `q` over `d` aka `scrape interval`.
+- `lag(m[d])` - returns lag between the current timestamp and the timestamp from the previous data point in `m` over `d`.
+- `lifetime(m[d])` - returns lifetime of `q` over `d` in seconds. It is expected that `d` exceeds the lifetime of `m`.
+- `scrape_interval(m[d])` - returns the average interval in seconds between data points of `m` over `d` aka `scrape interval`.
 - Trigonometric functions - `sin(q)`, `cos(q)`, `asin(q)`, `acos(q)` and `pi()`.
 - `range_over_time(m[d])` - returns value range for `m` over `d` time window, i.e. `max_over_time(m[d])-min_over_time(m[d])`.
 - `median_over_time(m[d])` - calculates median values for `m` over `d` time window. Shorthand to `quantile_over_time(0.5, m[d])`.
 - `median(q)` - median aggregate. Shorthand to `quantile(0.5, q)`.
-- `limitk(k, q)` - limits the number of time series returned from `q` to `k`.
+- `limitk(k, q) by (group_labels)` - limits the number of time series returned from `q` to `k` per each `group_labels`. The returned set of `k` time series per each `group_labels` can change with each call.
 - `any(q) by (x)` - returns any time series from `q` for each group in `x`.
 - `keep_last_value(q)` - fills missing data (gaps) in `q` with the previous non-empty value.
 - `keep_next_value(q)` - fills missing data (gaps) in `q` with the next non-empty value.
@@ -121,8 +123,12 @@ This functionality can be tried at [an editable Grafana dashboard](http://play-g
   Example: `share_gt_over_time(up[24h], 0)` - returns service availability for the last 24 hours.
 - `count_le_over_time(m[d], le)` - returns the number of raw samples for `m` over `d`, which don't exceed `le`.
 - `count_gt_over_time(m[d], gt)` - returns the number of raw samples for `m` over `d`, which are bigger than `gt`.
+- `count_eq_over_time(m[d], N)` - returns the number of raw samples for `m` over `d` with values equal to `N`.
+- `count_ne_over_time(m[d], N)` - returns the number of raw samples for `m` over `d` with values not equal to `N`.
 - `tmin_over_time(m[d])` - returns timestamp for the minimum value for `m` over `d` time range.
 - `tmax_over_time(m[d])` - returns timestamp for the maximum value for `m` over `d` time range.
+- `tfirst_over_time(m[d])` - returns timestamp for the first sample for `m` over `d` time range.
+- `tlast_over_time(m[d])` - returns timestamp for the last sample for `m` over `d` time range.
 - `aggr_over_time(("aggr_func1", "aggr_func2", ...), m[d])` - simultaneously calculates all the listed `aggr_func*` for `m` over `d` time range.
   `aggr_func*` can contain any functions that accept range vector. For instance, `aggr_over_time(("min_over_time", "max_over_time", "rate"), m[d])`
   would calculate `min_over_time`, `max_over_time` and `rate` for `m[d]`.

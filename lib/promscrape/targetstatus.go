@@ -4,11 +4,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"path"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
@@ -19,9 +24,17 @@ var maxDroppedTargets = flag.Int("promscrape.maxDroppedTargets", 1000, "The maxi
 
 var tsmGlobal = newTargetStatusMap()
 
-// WriteHumanReadableTargetsStatus writes human-readable status for all the scrape targets to w.
-func WriteHumanReadableTargetsStatus(w io.Writer, showOriginalLabels bool) {
-	tsmGlobal.WriteHumanReadable(w, showOriginalLabels)
+// WriteHumanReadableTargetsStatus writes human-readable status for all the scrape targets to w according to r.
+func WriteHumanReadableTargetsStatus(w http.ResponseWriter, r *http.Request) {
+	showOriginalLabels, _ := strconv.ParseBool(r.FormValue("show_original_labels"))
+	showOnlyUnhealthy, _ := strconv.ParseBool(r.FormValue("show_only_unhealthy"))
+	if accept := r.Header.Get("Accept"); strings.Contains(accept, "text/html") {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		tsmGlobal.WriteTargetsHTML(w, showOnlyUnhealthy)
+	} else {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		tsmGlobal.WriteTargetsPlain(w, showOriginalLabels)
+	}
 }
 
 // WriteAPIV1Targets writes /api/v1/targets to w according to https://prometheus.io/docs/prometheus/latest/querying/api/#targets
@@ -46,45 +59,49 @@ func WriteAPIV1Targets(w io.Writer, state string) {
 
 type targetStatusMap struct {
 	mu sync.Mutex
-	m  map[uint64]targetStatus
+	m  map[*ScrapeWork]*targetStatus
 }
 
 func newTargetStatusMap() *targetStatusMap {
 	return &targetStatusMap{
-		m: make(map[uint64]targetStatus),
+		m: make(map[*ScrapeWork]*targetStatus),
 	}
 }
 
 func (tsm *targetStatusMap) Reset() {
 	tsm.mu.Lock()
-	tsm.m = make(map[uint64]targetStatus)
+	tsm.m = make(map[*ScrapeWork]*targetStatus)
 	tsm.mu.Unlock()
 }
 
 func (tsm *targetStatusMap) Register(sw *ScrapeWork) {
 	tsm.mu.Lock()
-	tsm.m[sw.ID] = targetStatus{
-		sw: *sw,
+	tsm.m[sw] = &targetStatus{
+		sw: sw,
 	}
 	tsm.mu.Unlock()
 }
 
 func (tsm *targetStatusMap) Unregister(sw *ScrapeWork) {
 	tsm.mu.Lock()
-	delete(tsm.m, sw.ID)
+	delete(tsm.m, sw)
 	tsm.mu.Unlock()
 }
 
 func (tsm *targetStatusMap) Update(sw *ScrapeWork, group string, up bool, scrapeTime, scrapeDuration int64, err error) {
 	tsm.mu.Lock()
-	tsm.m[sw.ID] = targetStatus{
-		sw:             *sw,
-		up:             up,
-		scrapeGroup:    group,
-		scrapeTime:     scrapeTime,
-		scrapeDuration: scrapeDuration,
-		err:            err,
+	ts := tsm.m[sw]
+	if ts == nil {
+		ts = &targetStatus{
+			sw: sw,
+		}
+		tsm.m[sw] = ts
 	}
+	ts.up = up
+	ts.scrapeGroup = group
+	ts.scrapeTime = scrapeTime
+	ts.scrapeDuration = scrapeDuration
+	ts.err = err
 	tsm.mu.Unlock()
 }
 
@@ -110,11 +127,11 @@ func (tsm *targetStatusMap) WriteActiveTargetsJSON(w io.Writer) {
 		st  targetStatus
 	}
 	kss := make([]keyStatus, 0, len(tsm.m))
-	for _, st := range tsm.m {
-		key := promLabelsString(st.sw.OriginalLabels)
+	for sw, st := range tsm.m {
+		key := promLabelsString(sw.OriginalLabels)
 		kss = append(kss, keyStatus{
 			key: key,
-			st:  st,
+			st:  *st,
 		})
 	}
 	tsm.mu.Unlock()
@@ -162,66 +179,8 @@ func writeLabelsJSON(w io.Writer, labels []prompbmarshal.Label) {
 	fmt.Fprintf(w, `}`)
 }
 
-func (tsm *targetStatusMap) WriteHumanReadable(w io.Writer, showOriginalLabels bool) {
-	byJob := make(map[string][]targetStatus)
-	tsm.mu.Lock()
-	for _, st := range tsm.m {
-		job := st.sw.Job()
-		byJob[job] = append(byJob[job], st)
-	}
-	tsm.mu.Unlock()
-
-	var jss []jobStatus
-	for job, statuses := range byJob {
-		jss = append(jss, jobStatus{
-			job:      job,
-			statuses: statuses,
-		})
-	}
-	sort.Slice(jss, func(i, j int) bool {
-		return jss[i].job < jss[j].job
-	})
-
-	for _, js := range jss {
-		sts := js.statuses
-		sort.Slice(sts, func(i, j int) bool {
-			return sts[i].sw.ScrapeURL < sts[j].sw.ScrapeURL
-		})
-		ups := 0
-		for _, st := range sts {
-			if st.up {
-				ups++
-			}
-		}
-		fmt.Fprintf(w, "job=%q (%d/%d up)\n", js.job, ups, len(sts))
-		for _, st := range sts {
-			state := "up"
-			if !st.up {
-				state = "down"
-			}
-			labelsStr := st.sw.LabelsString()
-			if showOriginalLabels {
-				labelsStr += ", originalLabels=" + promLabelsString(st.sw.OriginalLabels)
-			}
-			lastScrape := st.getDurationFromLastScrape()
-			errMsg := ""
-			if st.err != nil {
-				errMsg = st.err.Error()
-			}
-			fmt.Fprintf(w, "\tstate=%s, endpoint=%s, labels=%s, last_scrape=%.3fs ago, scrape_duration=%.3fs, error=%q\n",
-				state, st.sw.ScrapeURL, labelsStr, lastScrape.Seconds(), float64(st.scrapeDuration)/1000, errMsg)
-		}
-	}
-	fmt.Fprintf(w, "\n")
-}
-
-type jobStatus struct {
-	job      string
-	statuses []targetStatus
-}
-
 type targetStatus struct {
-	sw             ScrapeWork
+	sw             *ScrapeWork
 	up             bool
 	scrapeGroup    string
 	scrapeTime     int64
@@ -245,7 +204,6 @@ type droppedTarget struct {
 }
 
 func (dt *droppedTargets) Register(originalLabels []prompbmarshal.Label) {
-
 	key := promLabelsString(originalLabels)
 	currentTime := fasttime.UnixTimestamp()
 	dt.mu.Lock()
@@ -303,4 +261,85 @@ func (dt *droppedTargets) WriteDroppedTargetsJSON(w io.Writer) {
 
 var droppedTargetsMap = &droppedTargets{
 	m: make(map[string]droppedTarget),
+}
+
+type jobTargetStatus struct {
+	up             bool
+	endpoint       string
+	labels         []prompbmarshal.Label
+	originalLabels []prompbmarshal.Label
+	lastScrapeTime time.Duration
+	scrapeDuration time.Duration
+	error          string
+}
+
+type jobTargetsStatuses struct {
+	job           string
+	upCount       int
+	targetsTotal  int
+	targetsStatus []jobTargetStatus
+}
+
+func (tsm *targetStatusMap) getTargetsStatusByJob() []jobTargetsStatuses {
+	byJob := make(map[string][]targetStatus)
+	tsm.mu.Lock()
+	for _, st := range tsm.m {
+		job := st.sw.Job()
+		byJob[job] = append(byJob[job], *st)
+	}
+	tsm.mu.Unlock()
+
+	var jts []jobTargetsStatuses
+	for job, statuses := range byJob {
+		sort.Slice(statuses, func(i, j int) bool {
+			return statuses[i].sw.ScrapeURL < statuses[j].sw.ScrapeURL
+		})
+		ups := 0
+		var targetsStatuses []jobTargetStatus
+		for _, ts := range statuses {
+			if ts.up {
+				ups++
+			}
+		}
+		for _, st := range statuses {
+			errMsg := ""
+			if st.err != nil {
+				errMsg = st.err.Error()
+			}
+			targetsStatuses = append(targetsStatuses, jobTargetStatus{
+				up:             st.up,
+				endpoint:       st.sw.ScrapeURL,
+				labels:         promrelabel.FinalizeLabels(nil, st.sw.Labels),
+				originalLabels: st.sw.OriginalLabels,
+				lastScrapeTime: st.getDurationFromLastScrape(),
+				scrapeDuration: time.Duration(st.scrapeDuration) * time.Millisecond,
+				error:          errMsg,
+			})
+		}
+		jts = append(jts, jobTargetsStatuses{
+			job:           job,
+			upCount:       ups,
+			targetsTotal:  len(statuses),
+			targetsStatus: targetsStatuses,
+		})
+	}
+	sort.Slice(jts, func(i, j int) bool {
+		return jts[i].job < jts[j].job
+	})
+	return jts
+}
+
+// WriteTargetsHTML writes targets status grouped by job into writer w in html table,
+// accepts filter to show only unhealthy targets.
+func (tsm *targetStatusMap) WriteTargetsHTML(w io.Writer, showOnlyUnhealthy bool) {
+	jss := tsm.getTargetsStatusByJob()
+	targetsPath := path.Join(httpserver.GetPathPrefix(), "/targets")
+	WriteTargetsResponseHTML(w, jss, targetsPath, showOnlyUnhealthy)
+}
+
+// WriteTargetsPlain writes targets grouped by job into writer w in plain text,
+// accept filter to show original labels.
+func (tsm *targetStatusMap) WriteTargetsPlain(w io.Writer, showOriginalLabels bool) {
+	jss := tsm.getTargetsStatusByJob()
+	WriteTargetsResponsePlain(w, jss, showOriginalLabels)
 }

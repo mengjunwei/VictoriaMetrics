@@ -4,21 +4,30 @@ import (
 	"fmt"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
 // SDConfig represents docker swarm service discovery configuration
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config
 type SDConfig struct {
-	Host string `yaml:"host"`
-	// TODO: add support for proxy_url
+	Host    string   `yaml:"host"`
+	Role    string   `yaml:"role"`
+	Port    int      `yaml:"port,omitempty"`
+	Filters []Filter `yaml:"filters,omitempty"`
+
+	ProxyURL  proxy.URL           `yaml:"proxy_url,omitempty"`
 	TLSConfig *promauth.TLSConfig `yaml:"tls_config,omitempty"`
-	Role      string              `yaml:"role"`
-	Port      int                 `yaml:"port,omitempty"`
 	// refresh_interval is obtained from `-promscrape.dockerswarmSDCheckInterval` command-line option
 	BasicAuth       *promauth.BasicAuthConfig `yaml:"basic_auth,omitempty"`
 	BearerToken     string                    `yaml:"bearer_token,omitempty"`
 	BearerTokenFile string                    `yaml:"bearer_token_file,omitempty"`
+}
+
+// Filter is a filter, which can be passed to SDConfig.
+type Filter struct {
+	Name   string   `yaml:"name"`
+	Values []string `yaml:"values"`
 }
 
 // GetLabels returns dockerswarm labels according to sdc.

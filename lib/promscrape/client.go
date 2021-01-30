@@ -8,9 +8,11 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/fasthttp"
@@ -65,10 +67,14 @@ func newClient(sw *ScrapeWork) *client {
 			host += ":443"
 		}
 	}
+	dialFunc, err := newStatDialFunc(sw.ProxyURL, tlsCfg)
+	if err != nil {
+		logger.Fatalf("cannot create dial func: %s", err)
+	}
 	hc := &fasthttp.HostClient{
 		Addr:                         host,
 		Name:                         "vm_promscrape",
-		Dial:                         statDial,
+		Dial:                         dialFunc,
 		IsTLS:                        isTLS,
 		TLSConfig:                    tlsCfg,
 		MaxIdleConnDuration:          2 * sw.ScrapeInterval,
@@ -79,9 +85,14 @@ func newClient(sw *ScrapeWork) *client {
 	}
 	var sc *http.Client
 	if *streamParse || sw.StreamParse {
+		var proxy func(*http.Request) (*url.URL, error)
+		if proxyURL := sw.ProxyURL.URL(); proxyURL != nil {
+			proxy = http.ProxyURL(proxyURL)
+		}
 		sc = &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig:     tlsCfg,
+				Proxy:               proxy,
 				TLSHandshakeTimeout: 10 * time.Second,
 				IdleConnTimeout:     2 * sw.ScrapeInterval,
 				DisableCompression:  *disableCompression || sw.DisableCompression,
@@ -92,9 +103,8 @@ func newClient(sw *ScrapeWork) *client {
 		}
 	}
 	return &client{
-		hc: hc,
-		sc: sc,
-
+		hc:                 hc,
+		sc:                 sc,
 		scrapeURL:          sw.ScrapeURL,
 		host:               host,
 		requestURI:         requestURI,
@@ -198,14 +208,14 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	}
 	if ce := resp.Header.Peek("Content-Encoding"); string(ce) == "gzip" {
 		var err error
-		var src []byte
 		if swapResponseBodies {
-			src = append(src, dst...)
-			dst = dst[:0]
+			zb := gunzipBufPool.Get()
+			zb.B, err = fasthttp.AppendGunzipBytes(zb.B[:0], dst)
+			dst = append(dst[:0], zb.B...)
+			gunzipBufPool.Put(zb)
 		} else {
-			src = resp.Body()
+			dst, err = fasthttp.AppendGunzipBytes(dst, resp.Body())
 		}
-		dst, err = fasthttp.AppendGunzipBytes(dst, src)
 		if err != nil {
 			fasthttp.ReleaseResponse(resp)
 			scrapesGunzipFailed.Inc()
@@ -215,15 +225,17 @@ func (c *client) ReadData(dst []byte) ([]byte, error) {
 	} else if !swapResponseBodies {
 		dst = append(dst, resp.Body()...)
 	}
+	fasthttp.ReleaseResponse(resp)
 	if statusCode != fasthttp.StatusOK {
 		metrics.GetOrCreateCounter(fmt.Sprintf(`vm_promscrape_scrapes_total{status_code="%d"}`, statusCode)).Inc()
 		return dst, fmt.Errorf("unexpected status code returned when scraping %q: %d; expecting %d; response body: %q",
 			c.scrapeURL, statusCode, fasthttp.StatusOK, dst)
 	}
 	scrapesOK.Inc()
-	fasthttp.ReleaseResponse(resp)
 	return dst, nil
 }
+
+var gunzipBufPool bytesutil.ByteBufferPool
 
 var (
 	scrapesTimedout     = metrics.NewCounter(`vm_promscrape_scrapes_timed_out_total`)

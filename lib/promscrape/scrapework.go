@@ -17,6 +17,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/prometheus"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/metrics"
 	xxhash "github.com/cespare/xxhash/v2"
 )
@@ -27,10 +28,9 @@ var (
 )
 
 // ScrapeWork represents a unit of work for scraping Prometheus metrics.
+//
+// It must be immutable during its lifetime, since it is read from concurrently running goroutines.
 type ScrapeWork struct {
-	// Unique ID for the ScrapeWork.
-	ID uint64
-
 	// Full URL (including query args) for the scrape.
 	ScrapeURL string
 
@@ -70,6 +70,9 @@ type ScrapeWork struct {
 
 	// Auth config
 	AuthConfig *promauth.Config
+
+	// ProxyURL HTTP proxy url
+	ProxyURL proxy.URL
 
 	// Optional `metric_relabel_configs`.
 	MetricRelabelConfigs []promrelabel.ParsedRelabelConfig
@@ -144,7 +147,7 @@ func promLabelsString(labels []prompbmarshal.Label) string {
 
 type scrapeWork struct {
 	// Config for the scrape.
-	Config ScrapeWork
+	Config *ScrapeWork
 
 	// ReadData is called for reading the data.
 	ReadData func(dst []byte) ([]byte, error)
@@ -221,7 +224,9 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}) {
 
 func (sw *scrapeWork) logError(s string) {
 	if !*suppressScrapeErrors {
-		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s", sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), s)
+		logger.ErrorfSkipframes(1, "error when scraping %q from job %q with labels %s: %s; "+
+			"scrape errors can be disabled by -promscrape.suppressScrapeErrors command-line flag",
+			sw.Config.ScrapeURL, sw.Config.Job(), sw.Config.LabelsString(), s)
 	}
 }
 
@@ -249,7 +254,7 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 
 	// Common case: read all the data from scrape target to memory (body) and then process it.
 	// This case should work more optimally for than stream parse code above for common case when scrape target exposes
-	// up to a few thouthand metrics.
+	// up to a few thousand metrics.
 	body := leveledbytebufferpool.Get(sw.prevBodyLen)
 	var err error
 	body.B, err = sw.ReadData(body.B[:0])
@@ -306,43 +311,48 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	// body must be released only after wc is released, since wc refers to body.
 	sw.prevBodyLen = len(body.B)
 	leveledbytebufferpool.Put(body)
-	tsmGlobal.Update(&sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
 	return err
 }
 
 func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
-	sr, err := sw.GetStreamReader()
-	if err != nil {
-		return fmt.Errorf("cannot read data: %s", err)
-	}
 	samplesScraped := 0
 	samplesPostRelabeling := 0
+	responseSize := int64(0)
 	wc := writeRequestCtxPool.Get(sw.prevRowsLen)
-	var mu sync.Mutex
-	err = parser.ParseStream(sr, scrapeTimestamp, false, func(rows []parser.Row) error {
-		mu.Lock()
-		defer mu.Unlock()
-		samplesScraped += len(rows)
-		for i := range rows {
-			sw.addRowToTimeseries(wc, &rows[i], scrapeTimestamp, true)
-		}
-		// Push the collected rows to sw before returning from the callback, since they cannot be held
-		// after returning from the callback - this will result in data race.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825#issuecomment-723198247
-		samplesPostRelabeling += len(wc.writeRequest.Timeseries)
-		sw.updateSeriesAdded(wc)
-		startTime := time.Now()
-		sw.PushData(&wc.writeRequest)
-		pushDataDuration.UpdateDuration(startTime)
-		wc.resetNoRows()
-		return nil
-	})
+
+	sr, err := sw.GetStreamReader()
+	if err != nil {
+		err = fmt.Errorf("cannot read data: %s", err)
+	} else {
+		var mu sync.Mutex
+		err = parser.ParseStream(sr, scrapeTimestamp, false, func(rows []parser.Row) error {
+			mu.Lock()
+			defer mu.Unlock()
+			samplesScraped += len(rows)
+			for i := range rows {
+				sw.addRowToTimeseries(wc, &rows[i], scrapeTimestamp, true)
+			}
+			// Push the collected rows to sw before returning from the callback, since they cannot be held
+			// after returning from the callback - this will result in data race.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825#issuecomment-723198247
+			samplesPostRelabeling += len(wc.writeRequest.Timeseries)
+			sw.updateSeriesAdded(wc)
+			startTime := time.Now()
+			sw.PushData(&wc.writeRequest)
+			pushDataDuration.UpdateDuration(startTime)
+			wc.resetNoRows()
+			return nil
+		}, sw.logError)
+		responseSize = sr.bytesRead
+		sr.MustClose()
+	}
+
 	scrapedSamples.Update(float64(samplesScraped))
 	endTimestamp := time.Now().UnixNano() / 1e6
 	duration := float64(endTimestamp-realTimestamp) / 1e3
 	scrapeDuration.Update(duration)
-	scrapeResponseSize.Update(float64(sr.bytesRead))
-	sr.MustClose()
+	scrapeResponseSize.Update(float64(responseSize))
 	up := 1
 	if err != nil {
 		if samplesScraped == 0 {
@@ -362,8 +372,8 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 	sw.prevRowsLen = len(wc.rows.Rows)
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
-	tsmGlobal.Update(&sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
-	return nil
+	tsmGlobal.Update(sw.Config, sw.ScrapeGroup, up == 1, realTimestamp, int64(duration*1000), err)
+	return err
 }
 
 // leveledWriteRequestCtxPool allows reducing memory usage when writeRequesCtx

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
@@ -33,11 +34,16 @@ func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result,
 		defer func() {
 			d := time.Since(startTime)
 			if d >= *logSlowQueryDuration {
-				logger.Warnf("slow query according to -search.logSlowQueryDuration=%s: duration=%.3f seconds, start=%d, end=%d, step=%d, accountID=%d, projectID=%d, query=%q",
-					*logSlowQueryDuration, d.Seconds(), ec.Start/1000, ec.End/1000, ec.Step/1000, ec.AuthToken.AccountID, ec.AuthToken.ProjectID, q)
+				logger.Warnf("slow query according to -search.logSlowQueryDuration=%s: remoteAddr=%s, duration=%.3f seconds, start=%d, end=%d, step=%d, accountID=%d, projectID=%d, query=%q",
+					*logSlowQueryDuration, ec.QuotedRemoteAddr, d.Seconds(), ec.Start/1000, ec.End/1000, ec.Step/1000, ec.AuthToken.AccountID, ec.AuthToken.ProjectID, q)
 				slowQueries.Inc()
 			}
 		}()
+	}
+	if querystats.Enabled() {
+		startTime := time.Now()
+		ac := ec.AuthToken
+		defer querystats.RegisterQuery(ac.AccountID, ac.ProjectID, q, ec.End-ec.Start, startTime)
 	}
 
 	ec.validate()
@@ -149,16 +155,32 @@ func adjustCmpOps(e metricsql.Expr) metricsql.Expr {
 		if !metricsql.IsBinaryOpCmp(be.Op) {
 			return
 		}
-		if _, ok := be.Left.(*metricsql.NumberExpr); !ok {
+		if isNumberExpr(be.Right) || !isScalarExpr(be.Left) {
 			return
 		}
 		// Convert 'num cmpOp query' expression to `query reverseCmpOp num` expression
-		// like Prometheus does. For isntance, `0.5 < foo` must be converted to `foo > 0.5`
+		// like Prometheus does. For instance, `0.5 < foo` must be converted to `foo > 0.5`
 		// in order to return valid values for `foo` that are bigger than 0.5.
 		be.Right, be.Left = be.Left, be.Right
 		be.Op = getReverseCmpOp(be.Op)
 	})
 	return e
+}
+
+func isNumberExpr(e metricsql.Expr) bool {
+	_, ok := e.(*metricsql.NumberExpr)
+	return ok
+}
+
+func isScalarExpr(e metricsql.Expr) bool {
+	if isNumberExpr(e) {
+		return true
+	}
+	if fe, ok := e.(*metricsql.FuncExpr); ok {
+		// time() returns scalar in PromQL - see https://prometheus.io/docs/prometheus/latest/querying/functions/#time
+		return strings.ToLower(fe.Name) == "time"
+	}
+	return false
 }
 
 func getReverseCmpOp(op string) string {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,9 +14,11 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/bufferedwriter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/promql"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
@@ -153,7 +154,7 @@ func ExportCSVHandler(startTime time.Time, at *auth.Token, w http.ResponseWriter
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
 
-	resultsCh := make(chan *quicktemplate.ByteBuffer, runtime.GOMAXPROCS(-1))
+	resultsCh := make(chan *quicktemplate.ByteBuffer, cgroup.AvailableCPUs())
 	doneCh := make(chan error)
 	go func() {
 		err := netstorage.ExportBlocks(at, sq, deadline, func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error {
@@ -381,7 +382,7 @@ func exportHandler(at *auth.Token, w http.ResponseWriter, r *http.Request, match
 	bw := bufferedwriter.Get(w)
 	defer bufferedwriter.Put(bw)
 
-	resultsCh := make(chan *quicktemplate.ByteBuffer, runtime.GOMAXPROCS(-1))
+	resultsCh := make(chan *quicktemplate.ByteBuffer, cgroup.AvailableCPUs())
 	doneCh := make(chan error)
 	if !reduceMemUsage {
 		denyPartialResponse := searchutils.GetDenyPartialResponse(r)
@@ -500,8 +501,15 @@ func DeleteHandler(startTime time.Time, at *auth.Token, r *http.Request) error {
 var deleteDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/admin/tsdb/delete_series"}`)
 
 func resetRollupResultCaches() {
+	resetRollupResultCacheCalls.Inc()
+	// Reset local cache before checking whether selectNodes list is empty.
+	// This guarantees that at least local cache is reset if selectNodes list is empty.
+	promql.ResetRollupResultCache()
 	if len(*selectNodes) == 0 {
-		logger.Panicf("BUG: missing -selectNode flag")
+		logger.Warnf("missing -selectNode flag, cache reset request wont be propagated to the other vmselect nodes." +
+			"This can be fixed by enumerating all the vmselect node addresses in `-selectNode` command line flag. " +
+			" For example: -selectNode=select-addr-1:8481,select-addr-2:8481")
+		return
 	}
 	for _, selectNode := range *selectNodes {
 		callURL := fmt.Sprintf("http://%s/internal/resetRollupResultCache", selectNode)
@@ -519,7 +527,6 @@ func resetRollupResultCaches() {
 		}
 		_ = resp.Body.Close()
 	}
-	resetRollupResultCacheCalls.Inc()
 }
 
 var (
@@ -1320,3 +1327,39 @@ func getLatencyOffsetMilliseconds() int64 {
 	}
 	return d
 }
+
+// QueryStatsHandler returns query stats at `/api/v1/status/top_queries`
+func QueryStatsHandler(startTime time.Time, at *auth.Token, w http.ResponseWriter, r *http.Request) error {
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
+	topN := 20
+	topNStr := r.FormValue("topN")
+	if len(topNStr) > 0 {
+		n, err := strconv.Atoi(topNStr)
+		if err != nil {
+			return fmt.Errorf("cannot parse `topN` arg %q: %w", topNStr, err)
+		}
+		topN = n
+	}
+	maxLifetimeMsecs, err := searchutils.GetDuration(r, "maxLifetime", 10*60*1000)
+	if err != nil {
+		return fmt.Errorf("cannot parse `maxLifetime` arg: %w", err)
+	}
+	maxLifetime := time.Duration(maxLifetimeMsecs) * time.Millisecond
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	bw := bufferedwriter.Get(w)
+	defer bufferedwriter.Put(bw)
+	if at == nil {
+		querystats.WriteJSONQueryStats(bw, topN, maxLifetime)
+	} else {
+		querystats.WriteJSONQueryStatsForAccountProject(bw, topN, at.AccountID, at.ProjectID, maxLifetime)
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	queryStatsDuration.UpdateDuration(startTime)
+	return nil
+}
+
+var queryStatsDuration = metrics.NewSummary(`vm_request_duration_seconds{path="/api/v1/status/top_queries"}`)

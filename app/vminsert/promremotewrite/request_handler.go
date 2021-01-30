@@ -8,6 +8,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/promremotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
@@ -22,14 +24,18 @@ var (
 
 // InsertHandler processes remote write for prometheus.
 func InsertHandler(at *auth.Token, req *http.Request) error {
+	extraLabels, err := parserCommon.GetExtraLabels(req)
+	if err != nil {
+		return err
+	}
 	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(req, func(timeseries []prompb.TimeSeries) error {
-			return insertRows(at, timeseries)
+		return parser.ParseStream(req, func(tss []prompb.TimeSeries) error {
+			return insertRows(at, tss, extraLabels)
 		})
 	})
 }
 
-func insertRows(at *auth.Token, timeseries []prompb.TimeSeries) error {
+func insertRows(at *auth.Token, timeseries []prompb.TimeSeries, extraLabels []prompbmarshal.Label) error {
 	ctx := netstorage.GetInsertCtx()
 	defer netstorage.PutInsertCtx(ctx)
 
@@ -49,6 +55,10 @@ func insertRows(at *auth.Token, timeseries []prompb.TimeSeries) error {
 		}
 		for k, v := range tmpLabelMap {
 			ctx.AddLabel(k, v)
+		}
+		for j := range extraLabels {
+			label := &extraLabels[j]
+			ctx.AddLabel(label.Name, label.Value)
 		}
 		if hasRelabeling {
 			ctx.ApplyRelabeling()

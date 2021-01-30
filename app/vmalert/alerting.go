@@ -137,14 +137,20 @@ func (ar *AlertingRule) Exec(ctx context.Context, q datasource.Querier, series b
 		}
 	}
 
+	qFn := func(query string) ([]datasource.Metric, error) { return q.Query(ctx, query) }
 	updated := make(map[uint64]struct{})
 	// update list of active alerts
 	for _, m := range qMetrics {
-		for k, v := range ar.Labels {
-			// apply extra labels
+		// extra labels could contain templates, so we expand them first
+		labels, err := expandLabels(m, qFn, ar)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand labels: %s", err)
+		}
+		for k, v := range labels {
+			// apply extra labels to datasource
+			// so the hash key will be consistent on restore
 			m.SetLabel(k, v)
 		}
-
 		h := hash(m)
 		if _, ok := updated[h]; ok {
 			// duplicate may be caused by extra labels
@@ -157,15 +163,15 @@ func (ar *AlertingRule) Exec(ctx context.Context, q datasource.Querier, series b
 				// update Value field with latest value
 				a.Value = m.Value
 				// and re-exec template since Value can be used
-				// in templates
-				err = ar.template(a)
+				// in annotations
+				a.Annotations, err = a.ExecTemplate(qFn, ar.Annotations)
 				if err != nil {
 					return nil, err
 				}
 			}
 			continue
 		}
-		a, err := ar.newAlert(m, ar.lastExecTime)
+		a, err := ar.newAlert(m, ar.lastExecTime, qFn)
 		if err != nil {
 			ar.lastExecError = err
 			return nil, fmt.Errorf("failed to create alert: %w", err)
@@ -197,6 +203,19 @@ func (ar *AlertingRule) Exec(ctx context.Context, q datasource.Querier, series b
 		return ar.toTimeSeries(ar.lastExecTime), nil
 	}
 	return nil, nil
+}
+
+func expandLabels(m datasource.Metric, q notifier.QueryFn, ar *AlertingRule) (map[string]string, error) {
+	metricLabels := make(map[string]string)
+	for _, l := range m.Labels {
+		metricLabels[l.Name] = l.Value
+	}
+	tpl := notifier.AlertTplData{
+		Labels: metricLabels,
+		Value:  m.Value,
+		Expr:   ar.Expr,
+	}
+	return notifier.ExecTemplate(q, ar.Labels, tpl)
 }
 
 func (ar *AlertingRule) toTimeSeries(timestamp time.Time) []prompbmarshal.TimeSeries {
@@ -245,7 +264,7 @@ func hash(m datasource.Metric) uint64 {
 	return hash.Sum64()
 }
 
-func (ar *AlertingRule) newAlert(m datasource.Metric, start time.Time) (*notifier.Alert, error) {
+func (ar *AlertingRule) newAlert(m datasource.Metric, start time.Time, qFn notifier.QueryFn) (*notifier.Alert, error) {
 	a := &notifier.Alert{
 		GroupID: ar.GroupID,
 		Name:    ar.Name,
@@ -264,17 +283,9 @@ func (ar *AlertingRule) newAlert(m datasource.Metric, start time.Time) (*notifie
 		}
 		a.Labels[l.Name] = l.Value
 	}
-	return a, ar.template(a)
-}
-
-func (ar *AlertingRule) template(a *notifier.Alert) error {
 	var err error
-	a.Labels, err = a.ExecTemplate(a.Labels)
-	if err != nil {
-		return err
-	}
-	a.Annotations, err = a.ExecTemplate(ar.Annotations)
-	return err
+	a.Annotations, err = a.ExecTemplate(qFn, ar.Annotations)
+	return a, err
 }
 
 // AlertAPI generates APIAlert object from alert by its id(hash)
@@ -393,6 +404,8 @@ func (ar *AlertingRule) Restore(ctx context.Context, q datasource.Querier, lookb
 		return fmt.Errorf("querier is nil")
 	}
 
+	qFn := func(query string) ([]datasource.Metric, error) { return q.Query(ctx, query) }
+
 	// account for external labels in filter
 	var labelsFilter string
 	for k, v := range labels {
@@ -421,7 +434,7 @@ func (ar *AlertingRule) Restore(ctx context.Context, q datasource.Querier, lookb
 			m.Labels = append(m.Labels, l)
 		}
 
-		a, err := ar.newAlert(m, time.Unix(int64(m.Value), 0))
+		a, err := ar.newAlert(m, time.Unix(int64(m.Value), 0), qFn)
 		if err != nil {
 			return fmt.Errorf("failed to create alert: %w", err)
 		}

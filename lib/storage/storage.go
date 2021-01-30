@@ -8,13 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
@@ -941,7 +941,7 @@ var (
 	// Limit the concurrency for TSID searches to GOMAXPROCS*2, since this operation
 	// is CPU bound and sometimes disk IO bound, so there is no sense in running more
 	// than GOMAXPROCS*2 concurrent goroutines for TSID searches.
-	searchTSIDsConcurrencyCh = make(chan struct{}, runtime.GOMAXPROCS(-1)*2)
+	searchTSIDsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs()*2)
 )
 
 // prefetchMetricNames pre-fetches metric names for the given tsids into metricID->metricName cache.
@@ -1230,7 +1230,7 @@ var (
 	// Limit the concurrency for data ingestion to GOMAXPROCS, since this operation
 	// is CPU bound, so there is no sense in running more than GOMAXPROCS concurrent
 	// goroutines on data ingestion path.
-	addRowsConcurrencyCh = make(chan struct{}, runtime.GOMAXPROCS(-1))
+	addRowsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
 	addRowsTimeout       = 30 * time.Second
 )
 
@@ -1324,9 +1324,10 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		if mr.Timestamp < minTimestamp {
 			// Skip rows with too small timestamps outside the retention.
 			if firstWarn == nil {
+				metricName := getUserReadableMetricName(mr.MetricNameRaw)
 				firstWarn = fmt.Errorf("cannot insert row with too small timestamp %d outside the retention; minimum allowed timestamp is %d; "+
-					"probably you need updating -retentionPeriod command-line flag",
-					mr.Timestamp, minTimestamp)
+					"probably you need updating -retentionPeriod command-line flag; metricName: %s",
+					mr.Timestamp, minTimestamp, metricName)
 			}
 			atomic.AddUint64(&s.tooSmallTimestampRows, 1)
 			continue
@@ -1334,9 +1335,9 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		if mr.Timestamp > maxTimestamp {
 			// Skip rows with too big timestamps significantly exceeding the current time.
 			if firstWarn == nil {
-				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowd timestamp is %d; "+
-					"propbably you need updating -retentionPeriod command-line flag",
-					mr.Timestamp, maxTimestamp)
+				metricName := getUserReadableMetricName(mr.MetricNameRaw)
+				firstWarn = fmt.Errorf("cannot insert row with too big timestamp %d exceeding the current time; maximum allowed timestamp is %d; metricName: %s",
+					mr.Timestamp, maxTimestamp, metricName)
 			}
 			atomic.AddUint64(&s.tooBigTimestampRows, 1)
 			continue
@@ -1443,6 +1444,14 @@ func (s *Storage) add(rows []rawRow, mrs []MetricRow, precisionBits uint8) ([]ra
 		return rows, fmt.Errorf("error occurred during rows addition: %w", firstError)
 	}
 	return rows, nil
+}
+
+func getUserReadableMetricName(metricNameRaw []byte) string {
+	var mn MetricName
+	if err := mn.unmarshalRaw(metricNameRaw); err != nil {
+		return fmt.Sprintf("cannot unmarshal metricNameRaw %q: %s", metricNameRaw, err)
+	}
+	return mn.String()
 }
 
 type pendingMetricRow struct {

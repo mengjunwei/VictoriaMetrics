@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -369,7 +369,7 @@ func (tb *Table) AddItems(items [][]byte) error {
 			tb.rawItemsBlocks = append(tb.rawItemsBlocks, ib)
 		}
 	}
-	if len(tb.rawItemsBlocks) >= 1024 {
+	if len(tb.rawItemsBlocks) >= 512 {
 		blocksToMerge = tb.rawItemsBlocks
 		tb.rawItemsBlocks = nil
 		tb.rawItemsLastFlushTime = fasttime.UnixTimestamp()
@@ -959,7 +959,7 @@ func (tb *Table) maxOutPartItemsSlow() uint64 {
 	return freeSpace / uint64(mergeWorkersCount) / 4
 }
 
-var mergeWorkersCount = runtime.GOMAXPROCS(-1)
+var mergeWorkersCount = cgroup.AvailableCPUs()
 
 func openParts(path string) ([]*partWrapper, error) {
 	// The path can be missing after restoring from backup, so create it if needed.
@@ -1305,21 +1305,35 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxItems u
 	// Sort src parts by itemsCount.
 	sort.Slice(src, func(i, j int) bool { return src[i].p.ph.itemsCount < src[j].p.ph.itemsCount })
 
-	n := maxPartsToMerge
-	if len(src) < n {
-		n = len(src)
+	minSrcParts := (maxPartsToMerge + 1) / 2
+	if minSrcParts < 2 {
+		minSrcParts = 2
+	}
+	maxSrcParts := maxPartsToMerge
+	if len(src) < maxSrcParts {
+		maxSrcParts = len(src)
 	}
 
-	// Exhaustive search for parts giving the lowest write amplification
-	// when merged.
+	// Exhaustive search for parts giving the lowest write amplification when merged.
 	var pws []*partWrapper
 	maxM := float64(0)
-	for i := 2; i <= n; i++ {
+	for i := minSrcParts; i <= maxSrcParts; i++ {
 		for j := 0; j <= len(src)-i; j++ {
-			itemsSum := uint64(0)
 			a := src[j : j+i]
+			if a[0].p.ph.itemsCount*uint64(len(a)) < a[len(a)-1].p.ph.itemsCount {
+				// Do not merge parts with too big difference in items count,
+				// since this results in unbalanced merges.
+				continue
+			}
+			itemsSum := uint64(0)
 			for _, pw := range a {
 				itemsSum += pw.p.ph.itemsCount
+			}
+			if itemsSum < 1e6 && len(a) < maxPartsToMerge {
+				// Do not merge parts with too small number of items if the number of source parts
+				// isn't equal to maxPartsToMerge. This should reduce CPU usage and disk IO usage
+				// for small parts merge.
+				continue
 			}
 			if itemsSum > maxItems {
 				// There is no sense in checking the remaining bigger parts.

@@ -70,6 +70,14 @@ func (r *Row) reset() {
 	r.Timestamp = 0
 }
 
+func skipTrailingComment(s string) string {
+	n := strings.IndexByte(s, '#')
+	if n < 0 {
+		return s
+	}
+	return s[:n]
+}
+
 func skipLeadingWhitespace(s string) string {
 	// Prometheus treats ' ' and '\t' as whitespace
 	// according to https://github.com/prometheus/docs/blob/master/content/docs/instrumenting/exposition_formats.md#text-format-details
@@ -133,6 +141,7 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 		return tagsPool, fmt.Errorf("metric cannot be empty")
 	}
 	s = skipLeadingWhitespace(s)
+	s = skipTrailingComment(s)
 	if len(s) == 0 {
 		return tagsPool, fmt.Errorf("value cannot be empty")
 	}
@@ -146,18 +155,31 @@ func (r *Row) unmarshal(s string, tagsPool []Tag, noEscapes bool) ([]Tag, error)
 		r.Value = v
 		return tagsPool, nil
 	}
-	// There is timestamp.
+	// There is a timestamp.
 	v, err := fastfloat.Parse(s[:n])
 	if err != nil {
 		return tagsPool, fmt.Errorf("cannot parse value %q: %w", s[:n], err)
 	}
+	r.Value = v
 	s = skipLeadingWhitespace(s[n+1:])
-	ts, err := fastfloat.ParseInt64(s)
+	if len(s) == 0 {
+		// There is no timestamp - just a whitespace after the value.
+		return tagsPool, nil
+	}
+	// There are some whitespaces after timestamp
+	s = skipTrailingWhitespace(s)
+	ts, err := fastfloat.Parse(s)
 	if err != nil {
 		return tagsPool, fmt.Errorf("cannot parse timestamp %q: %w", s, err)
 	}
-	r.Value = v
-	r.Timestamp = ts
+	if ts >= -1<<31 && ts < 1<<31 {
+		// This looks like OpenMetrics timestamp in Unix seconds.
+		// Convert it to milliseconds.
+		//
+		// See https://github.com/OpenObservability/OpenMetrics/blob/master/specification/OpenMetrics.md#timestamps
+		ts *= 1000
+	}
+	r.Timestamp = int64(ts)
 	return tagsPool, nil
 }
 

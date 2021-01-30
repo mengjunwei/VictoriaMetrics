@@ -7,7 +7,6 @@ import (
 	"math/bits"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
@@ -77,7 +77,7 @@ const finalPartsToMerge = 3
 // The number of shards for rawRow entries per partition.
 //
 // Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
-var rawRowsShardsPerPartition = (runtime.GOMAXPROCS(-1) + 7) / 8
+var rawRowsShardsPerPartition = (cgroup.AvailableCPUs() + 7) / 8
 
 // getMaxRowsPerPartition returns the maximum number of rows that haven't been converted into parts yet.
 func getMaxRawRowsPerPartition() int {
@@ -167,6 +167,7 @@ type partition struct {
 	bigPartsMergerWG       sync.WaitGroup
 	rawRowsFlusherWG       sync.WaitGroup
 	inmemoryPartsFlusherWG sync.WaitGroup
+	stalePartsRemoverWG    sync.WaitGroup
 }
 
 // partWrapper is a wrapper for the part.
@@ -239,6 +240,9 @@ func createPartition(timestamp int64, smallPartitionsPath, bigPartitionsPath str
 // The pt must be detached from table before calling pt.Drop.
 func (pt *partition) Drop() {
 	logger.Infof("dropping partition %q at smallPartsPath=%q, bigPartsPath=%q", pt.name, pt.smallPartsPath, pt.bigPartsPath)
+	// Wait until all the pending transaction deletions are finished before removing partition directories.
+	pendingTxnDeletionsWG.Wait()
+
 	fs.MustRemoveAll(pt.smallPartsPath)
 	fs.MustRemoveAll(pt.bigPartsPath)
 	logger.Infof("partition %q has been dropped", pt.name)
@@ -278,6 +282,7 @@ func openPartition(smallPartsPath, bigPartsPath string, getDeletedMetricIDs func
 	pt.startMergeWorkers()
 	pt.startRawRowsFlusher()
 	pt.startInmemoryPartsFlusher()
+	pt.startStalePartsRemover()
 
 	return pt, nil
 }
@@ -641,8 +646,16 @@ func (pt *partition) PutParts(pws []*partWrapper) {
 func (pt *partition) MustClose() {
 	close(pt.stopCh)
 
-	logger.Infof("waiting for inmemory parts flusher to stop on %q...", pt.smallPartsPath)
+	// Wait until all the pending transaction deletions are finished.
+	pendingTxnDeletionsWG.Wait()
+
+	logger.Infof("waiting for stale parts remover to stop on %q...", pt.smallPartsPath)
 	startTime := time.Now()
+	pt.stalePartsRemoverWG.Wait()
+	logger.Infof("stale parts remover stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), pt.smallPartsPath)
+
+	logger.Infof("waiting for inmemory parts flusher to stop on %q...", pt.smallPartsPath)
+	startTime = time.Now()
 	pt.inmemoryPartsFlusherWG.Wait()
 	logger.Infof("inmemory parts flusher stopped in %.3f seconds on %q", time.Since(startTime).Seconds(), pt.smallPartsPath)
 
@@ -882,8 +895,8 @@ func hasActiveMerges(pws []*partWrapper) bool {
 }
 
 var (
-	bigMergeWorkersCount   = (runtime.GOMAXPROCS(-1) + 1) / 2
-	smallMergeWorkersCount = (runtime.GOMAXPROCS(-1) + 1) / 2
+	bigMergeWorkersCount   = (cgroup.AvailableCPUs() + 1) / 2
+	smallMergeWorkersCount = (cgroup.AvailableCPUs() + 1) / 2
 )
 
 // SetBigMergeWorkersCount sets the maximum number of concurrent mergers for big blocks.
@@ -963,7 +976,7 @@ func (pt *partition) partsMerger(mergerFunc func(isFinal bool) error) error {
 		if !errors.Is(err, errNothingToMerge) {
 			return err
 		}
-		if fasttime.UnixTimestamp()-lastMergeTime > finalMergeDelaySeconds {
+		if finalMergeDelaySeconds > 0 && fasttime.UnixTimestamp()-lastMergeTime > finalMergeDelaySeconds {
 			// We have free time for merging into bigger parts.
 			// This should improve select performance.
 			lastMergeTime = fasttime.UnixTimestamp()
@@ -985,17 +998,18 @@ func (pt *partition) partsMerger(mergerFunc func(isFinal bool) error) error {
 	}
 }
 
-var finalMergeDelaySeconds = uint64(30)
+// Disable final merge by default, since it may lead to high disk IO and CPU usage
+// at the beginning of every month when merging data for the previous month.
+var finalMergeDelaySeconds = uint64(0)
 
 // SetFinalMergeDelay sets the delay before doing final merge for partitions without newly ingested data.
 //
 // This function may be called only before Storage initialization.
 func SetFinalMergeDelay(delay time.Duration) {
-	delaySeconds := int(delay.Seconds() + 0.5)
-	if delaySeconds <= 0 {
+	if delay <= 0 {
 		return
 	}
-	finalMergeDelaySeconds = uint64(delaySeconds)
+	finalMergeDelaySeconds = uint64(delay.Seconds() + 1)
 }
 
 func maxRowsByPath(path string) uint64 {
@@ -1025,22 +1039,45 @@ func (pt *partition) mergeBigParts(isFinal bool) error {
 }
 
 func (pt *partition) mergeSmallParts(isFinal bool) error {
-	maxRows := maxRowsByPath(pt.smallPartsPath)
-	if maxRows > maxRowsPerSmallPart() {
-		// The output part may go to big part,
-		// so make sure it has enough space.
-		maxBigPartRows := maxRowsByPath(pt.bigPartsPath)
-		if maxRows > maxBigPartRows {
-			maxRows = maxBigPartRows
-		}
+	// Try merging small parts to a big part at first.
+	maxBigPartRows := maxRowsByPath(pt.bigPartsPath)
+	pt.partsLock.Lock()
+	pws, needFreeSpace := getPartsToMerge(pt.smallParts, maxBigPartRows, isFinal)
+	pt.partsLock.Unlock()
+	atomicSetBool(&pt.bigMergeNeedFreeDiskSpace, needFreeSpace)
+
+	rowsCount := getRowsCount(pws)
+	if rowsCount > maxRowsPerSmallPart() {
+		// Merge small parts to a big part.
+		return pt.mergeParts(pws, pt.stopCh)
 	}
 
-	pt.partsLock.Lock()
-	pws, needFreeSpace := getPartsToMerge(pt.smallParts, maxRows, isFinal)
-	pt.partsLock.Unlock()
+	// Make sure that the output small part fits small parts storage.
+	maxSmallPartRows := maxRowsByPath(pt.smallPartsPath)
+	if rowsCount <= maxSmallPartRows {
+		// Merge small parts to a small part.
+		return pt.mergeParts(pws, pt.stopCh)
+	}
 
+	// The output small part doesn't fit small parts storage. Try merging small parts according to maxSmallPartRows limit.
+	pt.releasePartsToMerge(pws)
+	pt.partsLock.Lock()
+	pws, needFreeSpace = getPartsToMerge(pt.smallParts, maxSmallPartRows, isFinal)
+	pt.partsLock.Unlock()
 	atomicSetBool(&pt.smallMergeNeedFreeDiskSpace, needFreeSpace)
+
 	return pt.mergeParts(pws, pt.stopCh)
+}
+
+func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
+	pt.partsLock.Lock()
+	for _, pw := range pws {
+		if !pw.isInMerge {
+			logger.Panicf("BUG: missing isInMerge flag on the part %q", pw.p.path)
+		}
+		pw.isInMerge = false
+	}
+	pt.partsLock.Unlock()
 }
 
 var errNothingToMerge = fmt.Errorf("nothing to merge")
@@ -1063,18 +1100,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}) erro
 		// Nothing to merge.
 		return errNothingToMerge
 	}
-
-	defer func() {
-		// Remove isInMerge flag from pws.
-		pt.partsLock.Lock()
-		for _, pw := range pws {
-			if !pw.isInMerge {
-				logger.Panicf("BUG: missing isInMerge flag on the part %q", pw.p.path)
-			}
-			pw.isInMerge = false
-		}
-		pt.partsLock.Unlock()
-	}()
+	defer pt.releasePartsToMerge(pws)
 
 	startTime := time.Now()
 
@@ -1277,9 +1303,82 @@ func removeParts(pws []*partWrapper, partsToRemove map[*partWrapper]bool, isBig 
 	return dst, removedParts
 }
 
+func (pt *partition) startStalePartsRemover() {
+	pt.stalePartsRemoverWG.Add(1)
+	go func() {
+		pt.stalePartsRemover()
+		pt.stalePartsRemoverWG.Done()
+	}()
+}
+
+func (pt *partition) stalePartsRemover() {
+	ticker := time.NewTicker(7 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-pt.stopCh:
+			return
+		case <-ticker.C:
+			pt.removeStaleParts()
+		}
+	}
+}
+
+func (pt *partition) removeStaleParts() {
+	m := make(map[*partWrapper]bool)
+	startTime := time.Now()
+	retentionDeadline := timestampFromTime(startTime) - pt.retentionMsecs
+
+	pt.partsLock.Lock()
+	for _, pw := range pt.bigParts {
+		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+			atomic.AddUint64(&pt.bigRowsDeleted, pw.p.ph.RowsCount)
+			m[pw] = true
+		}
+	}
+	for _, pw := range pt.smallParts {
+		if !pw.isInMerge && pw.p.ph.MaxTimestamp < retentionDeadline {
+			atomic.AddUint64(&pt.smallRowsDeleted, pw.p.ph.RowsCount)
+			m[pw] = true
+		}
+	}
+	removedSmallParts := 0
+	removedBigParts := 0
+	if len(m) > 0 {
+		pt.smallParts, removedSmallParts = removeParts(pt.smallParts, m, false)
+		pt.bigParts, removedBigParts = removeParts(pt.bigParts, m, true)
+	}
+	pt.partsLock.Unlock()
+
+	if removedSmallParts+removedBigParts != len(m) {
+		logger.Panicf("BUG: unexpected number of stale parts removed; got %d, want %d", removedSmallParts+removedBigParts, len(m))
+	}
+
+	// Physically remove stale parts under snapshotLock in order to provide
+	// consistent snapshots with partition.CreateSnapshot().
+	pt.snapshotLock.RLock()
+	var removeWG sync.WaitGroup
+	for pw := range m {
+		logger.Infof("removing part %q, since its data is out of the configured retention (%d secs)", pw.p.path, retentionDeadline/1000)
+		removeWG.Add(1)
+		fs.MustRemoveAllWithDoneCallback(pw.p.path, removeWG.Done)
+	}
+	removeWG.Wait()
+	// There is no need in calling fs.MustSyncPath() on pt.smallPartsPath and pt.bigPartsPath,
+	// since they should be automatically called inside fs.MustRemoveAllWithDoneCallback.
+
+	pt.snapshotLock.RUnlock()
+
+	// Remove partition references from removed parts.
+	for pw := range m {
+		pw.decRef()
+	}
+
+}
+
 // getPartsToMerge returns optimal parts to merge from pws.
 //
-// The returned rows will contain less than maxRows rows.
+// The returned parts will contain less than maxRows rows.
 // The function returns true if pws contains parts, which cannot be merged because of maxRows limit.
 func getPartsToMerge(pws []*partWrapper, maxRows uint64, isFinal bool) ([]*partWrapper, bool) {
 	pwsRemaining := make([]*partWrapper, 0, len(pws))
@@ -1345,28 +1444,39 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxRows ui
 		return a.RowsCount < b.RowsCount
 	})
 
-	n := maxPartsToMerge
-	if len(src) < n {
-		n = len(src)
+	minSrcParts := (maxPartsToMerge + 1) / 2
+	if minSrcParts < 2 {
+		minSrcParts = 2
+	}
+	maxSrcParts := maxPartsToMerge
+	if len(src) < maxSrcParts {
+		maxSrcParts = len(src)
 	}
 
-	// Exhaustive search for parts giving the lowest write amplification
-	// when merged.
+	// Exhaustive search for parts giving the lowest write amplification when merged.
 	var pws []*partWrapper
 	maxM := float64(0)
-	for i := 2; i <= n; i++ {
+	for i := minSrcParts; i <= maxSrcParts; i++ {
 		for j := 0; j <= len(src)-i; j++ {
 			a := src[j : j+i]
-			rowsSum := uint64(0)
-			for _, pw := range a {
-				rowsSum += pw.p.ph.RowsCount
+			if a[0].p.ph.RowsCount*uint64(len(a)) < a[len(a)-1].p.ph.RowsCount {
+				// Do not merge parts with too big difference in rows count,
+				// since this results in unbalanced merges.
+				continue
 			}
-			if rowsSum > maxRows {
+			rowsCount := getRowsCount(a)
+			if rowsCount < 1e6 && len(a) < maxPartsToMerge {
+				// Do not merge parts with too small number of rows if the number of source parts
+				// isn't equal to maxPartsToMerge. This should reduce CPU usage and disk IO usage
+				// for small parts merge.
+				continue
+			}
+			if rowsCount > maxRows {
 				// There is no need in verifying remaining parts with higher number of rows
 				needFreeSpace = true
 				break
 			}
-			m := float64(rowsSum) / float64(a[len(a)-1].p.ph.RowsCount)
+			m := float64(rowsCount) / float64(a[len(a)-1].p.ph.RowsCount)
 			if m < maxM {
 				continue
 			}
@@ -1384,6 +1494,14 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxRows ui
 		return dst, false
 	}
 	return append(dst, pws...), needFreeSpace
+}
+
+func getRowsCount(pws []*partWrapper) uint64 {
+	n := uint64(0)
+	for _, pw := range pws {
+		n += pw.p.ph.RowsCount
+	}
+	return n
 }
 
 func openParts(pathPrefix1, pathPrefix2, path string) ([]*partWrapper, error) {
@@ -1628,10 +1746,12 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 		}
 	} else {
 		// Just remove srcPath.
-		fs.MustRemoveAll(srcPath)
+		removeWG.Add(1)
+		fs.MustRemoveAllWithDoneCallback(srcPath, removeWG.Done)
 	}
 
-	// Flush pathPrefix* directory metadata to the underying storage.
+	// Flush pathPrefix* directory metadata to the underying storage,
+	// so the moved files become visible there.
 	fs.MustSyncPath(pathPrefix1)
 	fs.MustSyncPath(pathPrefix2)
 
@@ -1641,6 +1761,10 @@ func runTransaction(txnLock *sync.RWMutex, pathPrefix1, pathPrefix2, txnPath str
 		// Remove the transaction file only after all the source paths are deleted.
 		// This is required for NFS mounts. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
 		removeWG.Wait()
+
+		// There is no need in calling fs.MustSyncPath for pathPrefix* after parts' removal,
+		// since it is already called by fs.MustRemoveAllWithDoneCallback.
+
 		if err := os.Remove(txnPath); err != nil {
 			logger.Errorf("cannot remove transaction file %q: %s", txnPath, err)
 		}

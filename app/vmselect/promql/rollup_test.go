@@ -285,6 +285,44 @@ func TestRollupCountGTOverTime(t *testing.T) {
 	f(1000, 0)
 }
 
+func TestRollupCountEQOverTime(t *testing.T) {
+	f := func(eq, vExpected float64) {
+		t.Helper()
+		eqs := []*timeseries{{
+			Values:     []float64{eq},
+			Timestamps: []int64{123},
+		}}
+		var me metricsql.MetricExpr
+		args := []interface{}{&metricsql.RollupExpr{Expr: &me}, eqs}
+		testRollupFunc(t, "count_eq_over_time", args, &me, vExpected)
+	}
+
+	f(-123, 0)
+	f(0, 0)
+	f(34, 4)
+	f(123, 1)
+	f(12, 1)
+}
+
+func TestRollupCountNEOverTime(t *testing.T) {
+	f := func(ne, vExpected float64) {
+		t.Helper()
+		nes := []*timeseries{{
+			Values:     []float64{ne},
+			Timestamps: []int64{123},
+		}}
+		var me metricsql.MetricExpr
+		args := []interface{}{&metricsql.RollupExpr{Expr: &me}, nes}
+		testRollupFunc(t, "count_ne_over_time", args, &me, vExpected)
+	}
+
+	f(-123, 12)
+	f(0, 12)
+	f(34, 8)
+	f(123, 11)
+	f(12, 11)
+}
+
 func TestRollupQuantileOverTime(t *testing.T) {
 	f := func(phi, vExpected float64) {
 		t.Helper()
@@ -423,6 +461,8 @@ func TestRollupNewRollupFuncSuccess(t *testing.T) {
 	f("max_over_time", 123)
 	f("tmin_over_time", 0.08)
 	f("tmax_over_time", 0.005)
+	f("tfirst_over_time", 0.005)
+	f("tlast_over_time", 0.13)
 	f("sum_over_time", 565)
 	f("sum2_over_time", 37951)
 	f("geomean_over_time", 39.33466603189148)
@@ -645,7 +685,7 @@ func TestRollupFuncsLookbackDelta(t *testing.T) {
 		}
 		rc.Timestamps = getTimestamps(rc.Start, rc.End, rc.Step)
 		values := rc.Do(nil, testValues, testTimestamps)
-		valuesExpected := []float64{12, nan, nan, nan, 34, 34, nan}
+		valuesExpected := []float64{99, nan, 44, nan, 32, 34, nan}
 		timestampsExpected := []int64{80, 90, 100, 110, 120, 130, 140}
 		testRowsEqual(t, values, rc.Timestamps, valuesExpected, timestampsExpected)
 	})
@@ -1133,8 +1173,16 @@ func TestRollupDelta(t *testing.T) {
 	f(nan, nan, nan, []float64{5, 6, 8}, 8)
 	f(2, nan, nan, []float64{5, 6, 8}, 6)
 
-	// Too big initial value must be skipped.
+	// Moderate initial value with zero delta after that.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/962
+	f(nan, nan, nan, []float64{100}, 100)
+	f(nan, nan, nan, []float64{100, 100}, 100)
+
+	// Big initial value with with zero delta after that.
 	f(nan, nan, nan, []float64{1000}, 0)
+	f(nan, nan, nan, []float64{1000, 1000}, 0)
+
+	// Big initial value with small delta after that.
 	f(nan, nan, nan, []float64{1000, 1001, 1002}, 2)
 
 	// Non-nan realPrevValue

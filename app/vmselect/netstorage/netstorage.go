@@ -3,11 +3,11 @@ package netstorage
 import (
 	"container/heap"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +17,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/handshake"
@@ -24,8 +25,13 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
 	"github.com/VictoriaMetrics/metrics"
+	xxhash "github.com/cespare/xxhash/v2"
 )
+
+var replicationFactor = flag.Int("replicationFactor", 1, "How many copies of every time series is available on vmstorage nodes. "+
+	"See -replicationFactor command-line flag for vminsert nodes")
 
 // Result is a single timeseries result.
 //
@@ -177,7 +183,7 @@ func (rss *Results) RunParallel(f func(rs *Result, workerID uint) error) error {
 var perQueryRowsProcessed = metrics.NewHistogram(`vm_per_query_rows_processed_count`)
 var perQuerySeriesProcessed = metrics.NewHistogram(`vm_per_query_series_processed_count`)
 
-var gomaxprocs = runtime.GOMAXPROCS(-1)
+var gomaxprocs = cgroup.AvailableCPUs()
 
 type packedTimeseries struct {
 	metricName string
@@ -265,7 +271,7 @@ func unpackWorker() {
 // unpackBatchSize is the maximum number of blocks that may be unpacked at once by a single goroutine.
 //
 // This batch is needed in order to reduce contention for upackWorkCh in multi-CPU system.
-var unpackBatchSize = 8 * runtime.GOMAXPROCS(-1)
+var unpackBatchSize = 8 * cgroup.AvailableCPUs()
 
 // Unpack unpacks pts to dst.
 func (pts *packedTimeseries) Unpack(tbf *tmpBlocksFile, dst *Result, tr storage.TimeRange, fetchData bool, at *auth.Token) error {
@@ -446,6 +452,42 @@ func (sbh *sortBlocksHeap) Pop() interface{} {
 	return v
 }
 
+// RegisterMetricNames registers metric names from mrs in the storage.
+func RegisterMetricNames(at *auth.Token, mrs []storage.MetricRow, deadline searchutils.Deadline) error {
+	// Split mrs among available vmstorage nodes.
+	mrsPerNode := make([][]storage.MetricRow, len(storageNodes))
+	for _, mr := range mrs {
+		idx := 0
+		if len(storageNodes) > 1 {
+			// There is no need in using the same hash as for time series distribution in vminsert,
+			// since RegisterMetricNames is used only in Graphite Tags API.
+			h := xxhash.Sum64(mr.MetricNameRaw)
+			idx = int(h % uint64(len(storageNodes)))
+		}
+		mrsPerNode[idx] = append(mrsPerNode[idx], mr)
+	}
+
+	// Push mrs to storage nodes in parallel.
+	snr := startStorageNodesRequest(true, func(idx int, sn *storageNode) interface{} {
+		sn.registerMetricNamesRequests.Inc()
+		err := sn.registerMetricNames(mrsPerNode[idx], deadline)
+		if err != nil {
+			sn.registerMetricNamesErrors.Inc()
+		}
+		return &err
+	})
+
+	// Collect results
+	err := snr.collectAllResults(func(result interface{}) error {
+		errP := result.(*error)
+		return *errP
+	})
+	if err != nil {
+		return fmt.Errorf("cannot register series on all the vmstorage nodes: %w", err)
+	}
+	return nil
+}
+
 // DeleteSeries deletes time series matching the given sq.
 func DeleteSeries(at *auth.Token, sq *storage.SearchQuery, deadline searchutils.Deadline) (int, error) {
 	requestData := sq.Marshal(nil)
@@ -455,37 +497,30 @@ func DeleteSeries(at *auth.Token, sq *storage.SearchQuery, deadline searchutils.
 		deletedCount int
 		err          error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.deleteSeriesRequests.Inc()
-			deletedCount, err := sn.deleteMetrics(requestData, deadline)
-			if err != nil {
-				sn.deleteSeriesRequestErrors.Inc()
-			}
-			resultsCh <- nodeResult{
-				deletedCount: deletedCount,
-				err:          err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(true, func(idx int, sn *storageNode) interface{} {
+		sn.deleteSeriesRequests.Inc()
+		deletedCount, err := sn.deleteMetrics(requestData, deadline)
+		if err != nil {
+			sn.deleteSeriesErrors.Inc()
+		}
+		return &nodeResult{
+			deletedCount: deletedCount,
+			err:          err,
+		}
+	})
 
 	// Collect results
 	deletedTotal := 0
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.deleteMetrics must be finished until the deadline.
-		nr := <-resultsCh
+	err := snr.collectAllResults(func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		deletedTotal += nr.deletedCount
-	}
-	if len(errors) > 0 {
-		// Return only the first error, since it has no sense in returning all errors.
-		return deletedTotal, fmt.Errorf("error occured during deleting time series: %w", errors[0])
+		return nil
+	})
+	if err != nil {
+		return deletedTotal, fmt.Errorf("cannot delete time series on all the vmstorage nodes: %w", err)
 	}
 	return deletedTotal, nil
 }
@@ -500,51 +535,33 @@ func GetLabelsOnTimeRange(at *auth.Token, denyPartialResponse bool, tr storage.T
 		labels []string
 		err    error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.labelsOnTimeRangeRequests.Inc()
-			labels, err := sn.getLabelsOnTimeRange(at.AccountID, at.ProjectID, tr, deadline)
-			if err != nil {
-				sn.labelsOnTimeRangeRequestErrors.Inc()
-				err = fmt.Errorf("cannot get labels on time range from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				labels: labels,
-				err:    err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.labelsOnTimeRangeRequests.Inc()
+		labels, err := sn.getLabelsOnTimeRange(at.AccountID, at.ProjectID, tr, deadline)
+		if err != nil {
+			sn.labelsOnTimeRangeErrors.Inc()
+			err = fmt.Errorf("cannot get labels on time range from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			labels: labels,
+			err:    err,
+		}
+	})
 
 	// Collect results
 	var labels []string
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getLabelsOnTimeRange must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialLabelsOnTimeRangeResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		labels = append(labels, nr.labels...)
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch labels on time range from vmstorage nodes: %w", err)
 	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching labels on time range: %w", errors[0])
-		}
 
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelsOnTimeRangeResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
-	}
 	// Deduplicate labels
 	labels = deduplicateStrings(labels)
 	// Substitute "" with "__name__"
@@ -569,11 +586,18 @@ func GetGraphiteTags(at *auth.Token, denyPartialResponse bool, filter string, li
 	}
 	// Substitute "__name__" with "name" for Graphite compatibility
 	for i := range labels {
-		if labels[i] == "__name__" {
+		if labels[i] != "__name__" {
+			continue
+		}
+		// Prevent from duplicate `name` tag.
+		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/942
+		if hasString(labels, "name") {
+			labels = append(labels[:i], labels[i+1:]...)
+		} else {
 			labels[i] = "name"
 			sort.Strings(labels)
-			break
 		}
+		break
 	}
 	if len(filter) > 0 {
 		labels, err = applyGraphiteRegexpFilter(filter, labels)
@@ -587,6 +611,15 @@ func GetGraphiteTags(at *auth.Token, denyPartialResponse bool, filter string, li
 	return labels, isPartial, nil
 }
 
+func hasString(a []string, s string) bool {
+	for _, x := range a {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // GetLabels returns labels until the given deadline.
 func GetLabels(at *auth.Token, denyPartialResponse bool, deadline searchutils.Deadline) ([]string, bool, error) {
 	if deadline.Exceeded() {
@@ -597,51 +630,33 @@ func GetLabels(at *auth.Token, denyPartialResponse bool, deadline searchutils.De
 		labels []string
 		err    error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.labelsRequests.Inc()
-			labels, err := sn.getLabels(at.AccountID, at.ProjectID, deadline)
-			if err != nil {
-				sn.labelsRequestErrors.Inc()
-				err = fmt.Errorf("cannot get labels from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				labels: labels,
-				err:    err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.labelsRequests.Inc()
+		labels, err := sn.getLabels(at.AccountID, at.ProjectID, deadline)
+		if err != nil {
+			sn.labelsErrors.Inc()
+			err = fmt.Errorf("cannot get labels from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			labels: labels,
+			err:    err,
+		}
+	})
 
 	// Collect results
 	var labels []string
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getLabels must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialLabelsResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		labels = append(labels, nr.labels...)
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch labels from vmstorage nodes: %w", err)
 	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching labels: %w", errors[0])
-		}
 
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelsResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
-	}
 	// Deduplicate labels
 	labels = deduplicateStrings(labels)
 	// Substitute "" with "__name__"
@@ -670,50 +685,31 @@ func GetLabelValuesOnTimeRange(at *auth.Token, denyPartialResponse bool, labelNa
 		labelValues []string
 		err         error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.labelValuesOnTimeRangeRequests.Inc()
-			labelValues, err := sn.getLabelValuesOnTimeRange(at.AccountID, at.ProjectID, labelName, tr, deadline)
-			if err != nil {
-				sn.labelValuesOnTimeRangeRequestErrors.Inc()
-				err = fmt.Errorf("cannot get label values on time range from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				labelValues: labelValues,
-				err:         err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.labelValuesOnTimeRangeRequests.Inc()
+		labelValues, err := sn.getLabelValuesOnTimeRange(at.AccountID, at.ProjectID, labelName, tr, deadline)
+		if err != nil {
+			sn.labelValuesOnTimeRangeErrors.Inc()
+			err = fmt.Errorf("cannot get label values on time range from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			labelValues: labelValues,
+			err:         err,
+		}
+	})
 
 	// Collect results
 	var labelValues []string
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getLabelValuesOnTimeRange must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialLabelValuesOnTimeRangeResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		labelValues = append(labelValues, nr.labelValues...)
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching label values on time range: %w", errors[0])
-		}
-
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelValuesOnTimeRangeResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch label values on time range from vmstorage nodes: %w", err)
 	}
 
 	// Deduplicate label values
@@ -762,50 +758,31 @@ func GetLabelValues(at *auth.Token, denyPartialResponse bool, labelName string, 
 		labelValues []string
 		err         error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.labelValuesRequests.Inc()
-			labelValues, err := sn.getLabelValues(at.AccountID, at.ProjectID, labelName, deadline)
-			if err != nil {
-				sn.labelValuesRequestErrors.Inc()
-				err = fmt.Errorf("cannot get label values from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				labelValues: labelValues,
-				err:         err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.labelValuesRequests.Inc()
+		labelValues, err := sn.getLabelValues(at.AccountID, at.ProjectID, labelName, deadline)
+		if err != nil {
+			sn.labelValuesErrors.Inc()
+			err = fmt.Errorf("cannot get label values from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			labelValues: labelValues,
+			err:         err,
+		}
+	})
 
 	// Collect results
 	var labelValues []string
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getLabelValues must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialLabelValuesResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		labelValues = append(labelValues, nr.labelValues...)
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching label values: %w", errors[0])
-		}
-
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelValuesResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch label values from vmstorage nodes: %w", err)
 	}
 
 	// Deduplicate label values
@@ -828,55 +805,36 @@ func GetTagValueSuffixes(at *auth.Token, denyPartialResponse bool, tr storage.Ti
 		suffixes []string
 		err      error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.tagValueSuffixesRequests.Inc()
-			suffixes, err := sn.getTagValueSuffixes(at.AccountID, at.ProjectID, tr, tagKey, tagValuePrefix, delimiter, deadline)
-			if err != nil {
-				sn.tagValueSuffixesRequestErrors.Inc()
-				err = fmt.Errorf("cannot get tag value suffixes for tr=%s, tagKey=%q, tagValuePrefix=%q, delimiter=%c from vmstorage %s: %w",
-					tr.String(), tagKey, tagValuePrefix, delimiter, sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				suffixes: suffixes,
-				err:      err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.tagValueSuffixesRequests.Inc()
+		suffixes, err := sn.getTagValueSuffixes(at.AccountID, at.ProjectID, tr, tagKey, tagValuePrefix, delimiter, deadline)
+		if err != nil {
+			sn.tagValueSuffixesErrors.Inc()
+			err = fmt.Errorf("cannot get tag value suffixes for tr=%s, tagKey=%q, tagValuePrefix=%q, delimiter=%c from vmstorage %s: %w",
+				tr.String(), tagKey, tagValuePrefix, delimiter, sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			suffixes: suffixes,
+			err:      err,
+		}
+	})
 
 	// Collect results
 	m := make(map[string]struct{})
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getTagValueSuffixes must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialTagValueSuffixesResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		for _, suffix := range nr.suffixes {
 			m[suffix] = struct{}{}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch tag value suffixes from vmstorage nodes: %w", err)
 	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching tag value suffixes for tr=%s, tagKey=%q, tagValuePrefix=%q, delimiter=%c: %w",
-				tr.String(), tagKey, tagValuePrefix, delimiter, errors[0])
-		}
 
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelEntriesResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
-	}
 	suffixes := make([]string, 0, len(m))
 	for suffix := range m {
 		suffixes = append(suffixes, suffix)
@@ -894,50 +852,31 @@ func GetLabelEntries(at *auth.Token, denyPartialResponse bool, deadline searchut
 		labelEntries []storage.TagEntry
 		err          error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.labelEntriesRequests.Inc()
-			labelEntries, err := sn.getLabelEntries(at.AccountID, at.ProjectID, deadline)
-			if err != nil {
-				sn.labelEntriesRequestErrors.Inc()
-				err = fmt.Errorf("cannot get label entries from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				labelEntries: labelEntries,
-				err:          err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.labelEntriesRequests.Inc()
+		labelEntries, err := sn.getLabelEntries(at.AccountID, at.ProjectID, deadline)
+		if err != nil {
+			sn.labelEntriesErrors.Inc()
+			err = fmt.Errorf("cannot get label entries from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			labelEntries: labelEntries,
+			err:          err,
+		}
+	})
 
 	// Collect results
 	var labelEntries []storage.TagEntry
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getLabelEntries must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialLabelEntriesResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		labelEntries = append(labelEntries, nr.labelEntries...)
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching label entries: %w", errors[0])
-		}
-
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialLabelEntriesResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot featch label etnries from vmstorage nodes: %w", err)
 	}
 
 	// Substitute "" with "__name__"
@@ -1003,49 +942,31 @@ func GetTSDBStatusForDate(at *auth.Token, denyPartialResponse bool, deadline sea
 		status *storage.TSDBStatus
 		err    error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.tsdbStatusRequests.Inc()
-			status, err := sn.getTSDBStatusForDate(at.AccountID, at.ProjectID, date, topN, deadline)
-			if err != nil {
-				sn.tsdbStatusRequestErrors.Inc()
-				err = fmt.Errorf("cannot obtain tsdb status from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				status: status,
-				err:    err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.tsdbStatusRequests.Inc()
+		status, err := sn.getTSDBStatusForDate(at.AccountID, at.ProjectID, date, topN, deadline)
+		if err != nil {
+			sn.tsdbStatusErrors.Inc()
+			err = fmt.Errorf("cannot obtain tsdb status from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			status: status,
+			err:    err,
+		}
+	})
 
 	// Collect results.
 	var statuses []*storage.TSDBStatus
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getTSDBStatusForDate must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialTSDBStatusResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		statuses = append(statuses, nr.status)
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, fmt.Errorf("error occured during fetching tsdb stats: %w", errors[0])
-		}
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialTSDBStatusResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch tsdb status from vmstorage nodes: %w", err)
 	}
 
 	status := mergeTSDBStatuses(statuses, topN)
@@ -1108,49 +1029,31 @@ func GetSeriesCount(at *auth.Token, denyPartialResponse bool, deadline searchuti
 		n   uint64
 		err error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.seriesCountRequests.Inc()
-			n, err := sn.getSeriesCount(at.AccountID, at.ProjectID, deadline)
-			if err != nil {
-				sn.seriesCountRequestErrors.Inc()
-				err = fmt.Errorf("cannot get series count from vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				n:   n,
-				err: err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.seriesCountRequests.Inc()
+		n, err := sn.getSeriesCount(at.AccountID, at.ProjectID, deadline)
+		if err != nil {
+			sn.seriesCountErrors.Inc()
+			err = fmt.Errorf("cannot get series count from vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			n:   n,
+			err: err,
+		}
+	})
 
 	// Collect results
 	var n uint64
-	var errors []error
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.getSeriesCount must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialSeriesCountResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		n += nr.n
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return 0, false, fmt.Errorf("error occured during fetching series count: %w", errors[0])
-		}
-		// Just log errors and return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		partialSeriesCountResults.Inc()
-		if denyPartialResponse {
-			return 0, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return 0, isPartial, fmt.Errorf("cannot fetch series count from vmstorage nodes: %w", err)
 	}
 	return n, isPartial, nil
 }
@@ -1207,7 +1110,6 @@ var metricNamePool = &sync.Pool{
 // ExportBlocks searches for time series matching sq and calls f for each found block.
 //
 // f is called in parallel from multiple goroutines.
-// Data processing is immediately stopped if f returns non-nil error.
 // It is the responsibility of f to call b.UnmarshalData before reading timestamps and values from the block.
 // It is the responsibility of f to filter blocks according to the given tr.
 func ExportBlocks(at *auth.Token, sq *storage.SearchQuery, deadline searchutils.Deadline, f func(mn *storage.MetricName, b *storage.Block, tr storage.TimeRange) error) error {
@@ -1218,7 +1120,14 @@ func ExportBlocks(at *auth.Token, sq *storage.SearchQuery, deadline searchutils.
 		MinTimestamp: sq.MinTimestamp,
 		MaxTimestamp: sq.MaxTimestamp,
 	}
+	var wg syncwg.WaitGroup
+	var stopped uint32
 	processBlock := func(mb *storage.MetricBlock) error {
+		wg.Add(1)
+		defer wg.Done()
+		if atomic.LoadUint32(&stopped) != 0 {
+			return nil
+		}
 		mn := metricNamePool.Get().(*storage.MetricName)
 		if err := mn.Unmarshal(mb.MetricName); err != nil {
 			return fmt.Errorf("cannot unmarshal metricName: %w", err)
@@ -1231,6 +1140,11 @@ func ExportBlocks(at *auth.Token, sq *storage.SearchQuery, deadline searchutils.
 		return nil
 	}
 	_, err := processSearchQuery(at, true, sq, true, processBlock, deadline)
+
+	// Make sure processBlock isn't called anymore in order to prevent from data races.
+	atomic.StoreUint32(&stopped, 1)
+	wg.Wait()
+
 	if err != nil {
 		return fmt.Errorf("error occured during export: %w", err)
 	}
@@ -1249,54 +1163,33 @@ func SearchMetricNames(at *auth.Token, denyPartialResponse bool, sq *storage.Sea
 		metricNames [][]byte
 		err         error
 	}
-	resultsCh := make(chan nodeResult, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.searchMetricNamesRequests.Inc()
-			metricNames, err := sn.processSearchMetricNames(requestData, deadline)
-			if err != nil {
-				sn.searchMetricNamesRequestErrors.Inc()
-				err = fmt.Errorf("cannot search metric names on vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- nodeResult{
-				metricNames: metricNames,
-				err:         err,
-			}
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.searchMetricNamesRequests.Inc()
+		metricNames, err := sn.processSearchMetricNames(requestData, deadline)
+		if err != nil {
+			sn.searchMetricNamesErrors.Inc()
+			err = fmt.Errorf("cannot search metric names on vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &nodeResult{
+			metricNames: metricNames,
+			err:         err,
+		}
+	})
 
 	// Collect results.
-	var errors []error
 	metricNames := make(map[string]struct{})
-	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.processSearchQuery must be finished until the deadline.
-		nr := <-resultsCh
+	isPartial, err := snr.collectResults(partialSearchMetricNamesResults, func(result interface{}) error {
+		nr := result.(*nodeResult)
 		if nr.err != nil {
-			errors = append(errors, nr.err)
-			continue
+			return nr.err
 		}
 		for _, metricName := range nr.metricNames {
 			metricNames[string(metricName)] = struct{}{}
 		}
-	}
-	isPartial := false
-	if len(errors) > 0 {
-		if len(errors) == len(storageNodes) {
-			// Return only the first error, since it has no sense in returning all errors.
-			return nil, false, errors[0]
-		}
-
-		// Just return partial results.
-		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
-		// Do not return the error, since it may spam logs on busy vmselect
-		// serving high amounts of requests.
-		partialSearchResults.Inc()
-		if denyPartialResponse {
-			return nil, true, errors[0]
-		}
-		isPartial = true
+		return nil
+	})
+	if err != nil {
+		return nil, isPartial, fmt.Errorf("cannot fetch metric names from vmstorage nodes: %w", err)
 	}
 
 	// Unmarshal metricNames
@@ -1327,7 +1220,14 @@ func ProcessSearchQuery(at *auth.Token, denyPartialResponse bool, sq *storage.Se
 		tbf: getTmpBlocksFile(),
 		m:   make(map[string][]tmpBlockAddr),
 	}
+	var wg syncwg.WaitGroup
+	var stopped uint32
 	processBlock := func(mb *storage.MetricBlock) error {
+		wg.Add(1)
+		defer wg.Done()
+		if atomic.LoadUint32(&stopped) != 0 {
+			return nil
+		}
 		if !fetchData {
 			tbfw.RegisterEmptyBlock(mb)
 			return nil
@@ -1338,6 +1238,11 @@ func ProcessSearchQuery(at *auth.Token, denyPartialResponse bool, sq *storage.Se
 		return nil
 	}
 	isPartial, err := processSearchQuery(at, denyPartialResponse, sq, fetchData, processBlock, deadline)
+
+	// Make sure processBlock isn't called anymore in order to protect from data races.
+	atomic.StoreUint32(&stopped, 1)
+	wg.Wait()
+
 	if err != nil {
 		putTmpBlocksFile(tbfw.tbf)
 		return nil, false, fmt.Errorf("error occured during search: %w", err)
@@ -1369,44 +1274,98 @@ func processSearchQuery(at *auth.Token, denyPartialResponse bool, sq *storage.Se
 	requestData := sq.Marshal(nil)
 
 	// Send the query to all the storage nodes in parallel.
-	resultsCh := make(chan error, len(storageNodes))
-	for _, sn := range storageNodes {
-		go func(sn *storageNode) {
-			sn.searchRequests.Inc()
-			err := sn.processSearchQuery(requestData, fetchData, processBlock, deadline)
-			if err != nil {
-				sn.searchRequestErrors.Inc()
-				err = fmt.Errorf("cannot perform search on vmstorage %s: %w", sn.connPool.Addr(), err)
-			}
-			resultsCh <- err
-		}(sn)
-	}
+	snr := startStorageNodesRequest(denyPartialResponse, func(idx int, sn *storageNode) interface{} {
+		sn.searchRequests.Inc()
+		err := sn.processSearchQuery(requestData, fetchData, processBlock, deadline)
+		if err != nil {
+			sn.searchErrors.Inc()
+			err = fmt.Errorf("cannot perform search on vmstorage %s: %w", sn.connPool.Addr(), err)
+		}
+		return &err
+	})
 
 	// Collect results.
+	isPartial, err := snr.collectResults(partialSearchResults, func(result interface{}) error {
+		errP := result.(*error)
+		return *errP
+	})
+	if err != nil {
+		return isPartial, fmt.Errorf("cannot fetch query results from vmstorage nodes: %w", err)
+	}
+	return isPartial, nil
+}
+
+type storageNodesRequest struct {
+	denyPartialResponse bool
+	resultsCh           chan interface{}
+}
+
+func startStorageNodesRequest(denyPartialResponse bool, f func(idx int, sn *storageNode) interface{}) *storageNodesRequest {
+	resultsCh := make(chan interface{}, len(storageNodes))
+	for idx, sn := range storageNodes {
+		go func(idx int, sn *storageNode) {
+			result := f(idx, sn)
+			resultsCh <- result
+		}(idx, sn)
+	}
+	return &storageNodesRequest{
+		denyPartialResponse: denyPartialResponse,
+		resultsCh:           resultsCh,
+	}
+}
+
+func (snr *storageNodesRequest) collectAllResults(f func(result interface{}) error) error {
 	var errors []error
 	for i := 0; i < len(storageNodes); i++ {
-		// There is no need in timer here, since all the goroutines executing
-		// sn.processSearchQuery must be finished until the deadline.
-		err := <-resultsCh
-		if err != nil {
+		result := <-snr.resultsCh
+		if err := f(result); err != nil {
 			errors = append(errors, err)
 			continue
+		}
+	}
+	if len(errors) > 0 {
+		return errors[0]
+	}
+	return nil
+}
+
+func (snr *storageNodesRequest) collectResults(partialResultsCounter *metrics.Counter, f func(result interface{}) error) (bool, error) {
+	var errors []error
+	resultsCollected := 0
+	for i := 0; i < len(storageNodes); i++ {
+		// There is no need in timer here, since all the goroutines executing the f function
+		// passed to startStorageNodesRequest must be finished until the deadline.
+		result := <-snr.resultsCh
+		if err := f(result); err != nil {
+			errors = append(errors, err)
+			continue
+		}
+		resultsCollected++
+		if resultsCollected > len(storageNodes)-*replicationFactor {
+			// There is no need in waiting for the remaining results,
+			// because the collected results contain all the data according to the given -replicationFactor.
+			// This should speed up responses when a part of vmstorage nodes are slow and/or temporarily unavailable.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/711
+			//
+			// It is expected that cap(snr.resultsCh) == len(storageNodes), otherwise goroutine leak is possible.
+			return false, nil
 		}
 	}
 	isPartial := false
 	if len(errors) > 0 {
 		if len(errors) == len(storageNodes) {
+			// All the vmstorage nodes returned error.
 			// Return only the first error, since it has no sense in returning all errors.
 			return false, errors[0]
 		}
 
-		// Just return partial results.
+		// Return partial results.
 		// This allows gracefully degrade vmselect in the case
-		// if certain storageNodes are temporarily unavailable.
+		// if a part of storageNodes are temporarily unavailable.
 		// Do not return the error, since it may spam logs on busy vmselect
 		// serving high amounts of requests.
-		partialSearchResults.Inc()
-		if denyPartialResponse {
+		partialResultsCounter.Inc()
+		if snr.denyPartialResponse {
 			return true, errors[0]
 		}
 		isPartial = true
@@ -1420,11 +1379,17 @@ type storageNode struct {
 	// The channel for limiting the maximum number of concurrent queries to storageNode.
 	concurrentQueriesCh chan struct{}
 
+	// The number of RegisterMetricNames requests to storageNode.
+	registerMetricNamesRequests *metrics.Counter
+
+	// The number of RegisterMetricNames request errors to storageNode.
+	registerMetricNamesErrors *metrics.Counter
+
 	// The number of DeleteSeries requests to storageNode.
 	deleteSeriesRequests *metrics.Counter
 
 	// The number of DeleteSeries request errors to storageNode.
-	deleteSeriesRequestErrors *metrics.Counter
+	deleteSeriesErrors *metrics.Counter
 
 	// The number of requests to labels.
 	labelsOnTimeRangeRequests *metrics.Counter
@@ -1433,10 +1398,10 @@ type storageNode struct {
 	labelsRequests *metrics.Counter
 
 	// The number of errors during requests to labels.
-	labelsOnTimeRangeRequestErrors *metrics.Counter
+	labelsOnTimeRangeErrors *metrics.Counter
 
 	// The number of errors during requests to labels.
-	labelsRequestErrors *metrics.Counter
+	labelsErrors *metrics.Counter
 
 	// The number of requests to labelValuesOnTimeRange.
 	labelValuesOnTimeRangeRequests *metrics.Counter
@@ -1445,34 +1410,34 @@ type storageNode struct {
 	labelValuesRequests *metrics.Counter
 
 	// The number of errors during requests to labelValuesOnTimeRange.
-	labelValuesOnTimeRangeRequestErrors *metrics.Counter
+	labelValuesOnTimeRangeErrors *metrics.Counter
 
 	// The number of errors during requests to labelValues.
-	labelValuesRequestErrors *metrics.Counter
+	labelValuesErrors *metrics.Counter
 
 	// The number of requests to labelEntries.
 	labelEntriesRequests *metrics.Counter
 
 	// The number of errors during requests to labelEntries.
-	labelEntriesRequestErrors *metrics.Counter
+	labelEntriesErrors *metrics.Counter
 
 	// The number of requests to tagValueSuffixes.
 	tagValueSuffixesRequests *metrics.Counter
 
 	// The number of errors during requests to tagValueSuffixes.
-	tagValueSuffixesRequestErrors *metrics.Counter
+	tagValueSuffixesErrors *metrics.Counter
 
 	// The number of requests to tsdb status.
 	tsdbStatusRequests *metrics.Counter
 
 	// The number of errors during requests to tsdb status.
-	tsdbStatusRequestErrors *metrics.Counter
+	tsdbStatusErrors *metrics.Counter
 
 	// The number of requests to seriesCount.
 	seriesCountRequests *metrics.Counter
 
 	// The number of errors during requests to seriesCount.
-	seriesCountRequestErrors *metrics.Counter
+	seriesCountErrors *metrics.Counter
 
 	// The number of 'search metric names' requests to storageNode.
 	searchMetricNamesRequests *metrics.Counter
@@ -1481,16 +1446,32 @@ type storageNode struct {
 	searchRequests *metrics.Counter
 
 	// The number of 'search metric names' errors to storageNode.
-	searchMetricNamesRequestErrors *metrics.Counter
+	searchMetricNamesErrors *metrics.Counter
 
 	// The number of search request errors to storageNode.
-	searchRequestErrors *metrics.Counter
+	searchErrors *metrics.Counter
 
 	// The number of metric blocks read.
 	metricBlocksRead *metrics.Counter
 
 	// The number of read metric rows.
 	metricRowsRead *metrics.Counter
+}
+
+func (sn *storageNode) registerMetricNames(mrs []storage.MetricRow, deadline searchutils.Deadline) error {
+	if len(mrs) == 0 {
+		return nil
+	}
+	f := func(bc *handshake.BufferedConn) error {
+		return sn.registerMetricNamesOnConn(bc, mrs)
+	}
+	if err := sn.execOnConn("registerMetricNames_v1", f, deadline); err != nil {
+		// Try again before giving up.
+		if err = sn.execOnConn("registerMetricNames_v1", f, deadline); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (sn *storageNode) deleteMetrics(requestData []byte, deadline searchutils.Deadline) (int, error) {
@@ -1806,6 +1787,34 @@ func newErrRemote(buf []byte) error {
 		Err:        err,
 		StatusCode: http.StatusServiceUnavailable,
 	}
+}
+
+func (sn *storageNode) registerMetricNamesOnConn(bc *handshake.BufferedConn, mrs []storage.MetricRow) error {
+	// Send the request to sn.
+	if err := writeUint64(bc, uint64(len(mrs))); err != nil {
+		return fmt.Errorf("cannot send metricsCount to conn: %w", err)
+	}
+	for i, mr := range mrs {
+		if err := writeBytes(bc, mr.MetricNameRaw); err != nil {
+			return fmt.Errorf("cannot send MetricNameRaw #%d to conn: %w", i+1, err)
+		}
+		if err := writeUint64(bc, uint64(mr.Timestamp)); err != nil {
+			return fmt.Errorf("cannot send Timestamp #%d to conn: %w", i+1, err)
+		}
+	}
+	if err := bc.Flush(); err != nil {
+		return fmt.Errorf("cannot flush registerMetricNames request to conn: %w", err)
+	}
+
+	// Read response error.
+	buf, err := readBytes(nil, bc, maxErrorMessageSize)
+	if err != nil {
+		return fmt.Errorf("cannot read error message: %w", err)
+	}
+	if len(buf) > 0 {
+		return newErrRemote(buf)
+	}
+	return nil
 }
 
 func (sn *storageNode) deleteMetricsOnConn(bc *handshake.BufferedConn, requestData []byte) (int, error) {
@@ -2363,30 +2372,32 @@ func InitStorageNodes(addrs []string) {
 
 			concurrentQueriesCh: make(chan struct{}, maxConcurrentQueriesPerStorageNode),
 
-			deleteSeriesRequests:                metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="deleteSeries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			deleteSeriesRequestErrors:           metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="deleteSeries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelsOnTimeRangeRequests:           metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelsOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelsRequests:                      metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labels", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelsOnTimeRangeRequestErrors:      metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelsOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelsRequestErrors:                 metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labels", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelValuesOnTimeRangeRequests:      metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelValuesOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelValuesRequests:                 metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelValues", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelValuesOnTimeRangeRequestErrors: metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelValuesOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelValuesRequestErrors:            metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelValues", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelEntriesRequests:                metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelEntries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			labelEntriesRequestErrors:           metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelEntries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			tagValueSuffixesRequests:            metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="tagValueSuffixes", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			tagValueSuffixesRequestErrors:       metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="tagValueSuffixes", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			tsdbStatusRequests:                  metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="tsdbStatus", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			tsdbStatusRequestErrors:             metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="tsdbStatus", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			seriesCountRequests:                 metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="seriesCount", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			seriesCountRequestErrors:            metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="seriesCount", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			searchMetricNamesRequests:           metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="searchMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			searchRequests:                      metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="search", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			searchMetricNamesRequestErrors:      metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="searchMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			searchRequestErrors:                 metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="search", type="rpcClient", name="vmselect", addr=%q}`, addr)),
-			metricBlocksRead:                    metrics.NewCounter(fmt.Sprintf(`vm_metric_blocks_read_total{name="vmselect", addr=%q}`, addr)),
-			metricRowsRead:                      metrics.NewCounter(fmt.Sprintf(`vm_metric_rows_read_total{name="vmselect", addr=%q}`, addr)),
+			registerMetricNamesRequests:    metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="registerMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			registerMetricNamesErrors:      metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="registerMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			deleteSeriesRequests:           metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="deleteSeries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			deleteSeriesErrors:             metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="deleteSeries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelsOnTimeRangeRequests:      metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelsOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelsRequests:                 metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labels", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelsOnTimeRangeErrors:        metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelsOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelsErrors:                   metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labels", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelValuesOnTimeRangeRequests: metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelValuesOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelValuesRequests:            metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelValues", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelValuesOnTimeRangeErrors:   metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelValuesOnTimeRange", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelValuesErrors:              metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelValues", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelEntriesRequests:           metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="labelEntries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			labelEntriesErrors:             metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="labelEntries", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			tagValueSuffixesRequests:       metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="tagValueSuffixes", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			tagValueSuffixesErrors:         metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="tagValueSuffixes", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			tsdbStatusRequests:             metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="tsdbStatus", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			tsdbStatusErrors:               metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="tsdbStatus", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			seriesCountRequests:            metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="seriesCount", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			seriesCountErrors:              metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="seriesCount", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			searchMetricNamesRequests:      metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="searchMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			searchRequests:                 metrics.NewCounter(fmt.Sprintf(`vm_requests_total{action="search", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			searchMetricNamesErrors:        metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="searchMetricNames", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			searchErrors:                   metrics.NewCounter(fmt.Sprintf(`vm_request_errors_total{action="search", type="rpcClient", name="vmselect", addr=%q}`, addr)),
+			metricBlocksRead:               metrics.NewCounter(fmt.Sprintf(`vm_metric_blocks_read_total{name="vmselect", addr=%q}`, addr)),
+			metricRowsRead:                 metrics.NewCounter(fmt.Sprintf(`vm_metric_rows_read_total{name="vmselect", addr=%q}`, addr)),
 		}
 		metrics.NewGauge(fmt.Sprintf(`vm_concurrent_queries{name="vmselect", addr=%q}`, addr), func() float64 {
 			return float64(len(sn.concurrentQueriesCh))
@@ -2401,14 +2412,16 @@ func Stop() {
 }
 
 var (
-	partialLabelsOnTimeRangeResults      = metrics.NewCounter(`vm_partial_labels_on_time_range_results_total{name="vmselect"}`)
-	partialLabelsResults                 = metrics.NewCounter(`vm_partial_labels_results_total{name="vmselect"}`)
-	partialLabelValuesOnTimeRangeResults = metrics.NewCounter(`vm_partial_label_values_on_time_range_results_total{name="vmselect"}`)
-	partialLabelValuesResults            = metrics.NewCounter(`vm_partial_label_values_results_total{name="vmselect"}`)
-	partialLabelEntriesResults           = metrics.NewCounter(`vm_partial_label_entries_results_total{name="vmselect"}`)
-	partialTSDBStatusResults             = metrics.NewCounter(`vm_partial_tsdb_status_results_total{name="vmselect"}`)
-	partialSeriesCountResults            = metrics.NewCounter(`vm_partial_series_count_results_total{name="vmselect"}`)
-	partialSearchResults                 = metrics.NewCounter(`vm_partial_search_results_total{name="vmselect"}`)
+	partialLabelsOnTimeRangeResults      = metrics.NewCounter(`vm_partial_results_total{type="labels_on_time_range", name="vmselect"}`)
+	partialLabelsResults                 = metrics.NewCounter(`vm_partial_results_total{type="labels", name="vmselect"}`)
+	partialLabelValuesOnTimeRangeResults = metrics.NewCounter(`vm_partial_results_total{type="label_values_on_time_range", name="vmselect"}`)
+	partialLabelValuesResults            = metrics.NewCounter(`vm_partial_results_total{type="label_values", name="vmselect"}`)
+	partialTagValueSuffixesResults       = metrics.NewCounter(`vm_partial_results_total{type="tag_value_suffixes", name="vmselect"}`)
+	partialLabelEntriesResults           = metrics.NewCounter(`vm_partial_results_total{type="label_entries", name="vmselect"}`)
+	partialTSDBStatusResults             = metrics.NewCounter(`vm_partial_results_total{type="tsdb_status", name="vmselect"}`)
+	partialSeriesCountResults            = metrics.NewCounter(`vm_partial_results_total{type="series_count", name="vmselect"}`)
+	partialSearchMetricNamesResults      = metrics.NewCounter(`vm_partial_results_total{type="search_metric_names", name="vmselect"}`)
+	partialSearchResults                 = metrics.NewCounter(`vm_partial_results_total{type="search", name="vmselect"}`)
 )
 
 // The maximum number of concurrent queries per storageNode.

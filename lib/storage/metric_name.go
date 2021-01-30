@@ -350,22 +350,23 @@ func hasTag(tags []string, key []byte) bool {
 }
 
 // String returns user-readable representation of the metric name.
-//
-// Use this function only for debug logging.
 func (mn *MetricName) String() string {
-	mn.sortTags()
+	var mnCopy MetricName
+	mnCopy.CopyFrom(mn)
+	mnCopy.sortTags()
 	var tags []string
-	for i := range mn.Tags {
-		t := &mn.Tags[i]
-		tags = append(tags, fmt.Sprintf("%q=%q", t.Key, t.Value))
+	for i := range mnCopy.Tags {
+		t := &mnCopy.Tags[i]
+		tags = append(tags, fmt.Sprintf("%s=%q", t.Key, t.Value))
 	}
-	tagsStr := strings.Join(tags, ", ")
-	return fmt.Sprintf("AccountID=%d, ProjectID=%d, MetricGroup=%q, tags=[%s]", mn.AccountID, mn.ProjectID, mn.MetricGroup, tagsStr)
+	tagsStr := strings.Join(tags, ",")
+	return fmt.Sprintf("AccountID=%d, ProjectID=%d, %s{%s}", mnCopy.AccountID, mnCopy.ProjectID, mnCopy.MetricGroup, tagsStr)
 }
 
 // Marshal appends marshaled mn to dst and returns the result.
 //
-// Tags must be sorted before calling this function.
+// mn.sortTags must be called before calling this function
+// in order to sort and de-duplcate tags.
 func (mn *MetricName) Marshal(dst []byte) []byte {
 	// Calculate the required size and pre-allocate space in dst
 	dstLen := len(dst)
@@ -380,7 +381,13 @@ func (mn *MetricName) Marshal(dst []byte) []byte {
 	dst = encoding.MarshalUint32(dst, mn.AccountID)
 	dst = encoding.MarshalUint32(dst, mn.ProjectID)
 	dst = marshalTagValue(dst, mn.MetricGroup)
-	dst = marshalTags(dst, mn.Tags)
+
+	// Marshal tags.
+	tags := mn.Tags
+	for i := range tags {
+		t := &tags[i]
+		dst = t.Marshal(dst)
+	}
 	return dst
 }
 
@@ -411,7 +418,7 @@ func (mn *MetricName) Unmarshal(src []byte) error {
 	}
 
 	// There is no need in verifying for identical tag keys,
-	// since they must be handled in MetricName.Marshal inside marshalTags.
+	// since they must be handled by MetricName.sortTags before calling MetricName.Marshal.
 
 	return nil
 }
@@ -419,7 +426,9 @@ func (mn *MetricName) Unmarshal(src []byte) error {
 // MarshalNoAccountIDProjectID appends marshaled mn without AccountID and ProjectID
 // to dst and returns the result.
 //
-// The result must be unmarshaled with UnmarshalNoAccountIDProjectID
+// The result must be unmarshaled with UnmarshalNoAccountIDProjectID.
+//
+// It is expected that mn.Tags are already sorted and de-duplicated with mn.sortTags.
 func (mn *MetricName) MarshalNoAccountIDProjectID(dst []byte) []byte {
 	// Calculate the required size and pre-allocate space in dst
 	dstLen := len(dst)
@@ -432,7 +441,11 @@ func (mn *MetricName) MarshalNoAccountIDProjectID(dst []byte) []byte {
 	dst = dst[:dstLen]
 
 	dst = marshalTagValue(dst, mn.MetricGroup)
-	dst = marshalTags(dst, mn.Tags)
+	tags := mn.Tags
+	for i := range tags {
+		t := &tags[i]
+		dst = t.Marshal(dst)
+	}
 	return dst
 }
 
@@ -479,7 +492,7 @@ var maxLabelsPerTimeseries = 30
 // SetMaxLabelsPerTimeseries sets the limit on the number of labels
 // per each time series.
 //
-// Superfouos labels are dropped.
+// Superfluous labels are dropped.
 func SetMaxLabelsPerTimeseries(maxLabels int) {
 	if maxLabels <= 0 {
 		logger.Panicf("BUG: maxLabels must be positive; got %d", maxLabels)
@@ -631,7 +644,10 @@ func unmarshalBytesFast(src []byte) ([]byte, []byte, error) {
 	return src[n:], src[:n], nil
 }
 
-// sortTags sorts tags in mn.
+// sortTags sorts tags in mn to canonical form needed for storing in the index.
+//
+// The function also de-duplicates tags with identical keys in mn. The last tag value
+// for duplicate tags wins.
 //
 // Tags sorting is quite slow, so try avoiding it by caching mn
 // with sorted tags.
@@ -653,12 +669,25 @@ func (mn *MetricName) sortTags() {
 	}
 	cts.tags = dst
 
-	// Use sort.Sort instead of sort.Slice, since sort.Slice allocates a lot.
-	sort.Sort(&cts.tags)
+	// Use sort.Stable instead of sort.Sort in order to preserve the order of tags with duplicate keys.
+	// The last tag value wins for tags with duplicate keys.
+	// Use sort.Stable instead of sort.SliceStable, since sort.SliceStable allocates a lot.
+	sort.Stable(&cts.tags)
 
+	j := 0
+	var prevKey []byte
 	for i := range cts.tags {
-		mn.Tags[i].copyFrom(&cts.tags[i].tag)
+		tag := &cts.tags[i].tag
+		if j > 0 && bytes.Equal(tag.Key, prevKey) {
+			// Overwrite the previous tag with duplicate key.
+			j--
+		} else {
+			prevKey = tag.Key
+		}
+		mn.Tags[j].copyFrom(tag)
+		j++
 	}
+	mn.Tags = mn.Tags[:j]
 
 	putCanonicalTags(cts)
 }
@@ -697,20 +726,6 @@ func (ts *canonicalTagsSort) Less(i, j int) bool {
 func (ts *canonicalTagsSort) Swap(i, j int) {
 	x := *ts
 	x[i], x[j] = x[j], x[i]
-}
-
-func marshalTags(dst []byte, tags []Tag) []byte {
-	var prevKey []byte
-	for i := range tags {
-		t := &tags[i]
-		if string(prevKey) == string(t.Key) {
-			// Skip duplicate keys, since they aren't allowed in Prometheus data model.
-			continue
-		}
-		prevKey = t.Key
-		dst = t.Marshal(dst)
-	}
-	return dst
 }
 
 func copyTags(dst, src []Tag) []Tag {

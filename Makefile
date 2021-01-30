@@ -10,25 +10,17 @@ endif
 
 GO_BUILDINFO = -X '$(PKG_PREFIX)/lib/buildinfo.Version=$(APP_NAME)-$(shell date -u +'%Y%m%d-%H%M%S')-$(BUILDINFO_TAG)'
 
+.PHONY: $(MAKECMDGOALS)
+
 all: \
 	vminsert \
 	vmselect \
-	vmstorage \
-	vmagent \
-	vmalert \
-	vmauth \
-	vmbackup \
-	vmrestore
+	vmstorage
 
 all-pure: \
 	vminsert-pure \
 	vmselect-pure \
-	vmstorage-pure \
-	vmagent-pure \
-	vmalert-pure \
-	vmauth-pure \
-	vmbackup-pure \
-	vmrestore-pure
+	vmstorage-pure
 
 include app/*/Makefile
 include deployment/*/Makefile
@@ -39,33 +31,15 @@ clean:
 publish: \
 	publish-vminsert \
 	publish-vmselect \
-	publish-vmstorage \
-	publish-vmagent \
-	publish-vmalert \
-	publish-vmauth \
-	publish-vmbackup \
-	publish-vmrestore
+	publish-vmstorage
 
 package: \
 	package-vminsert \
 	package-vmselect \
-	package-vmstorage \
-	package-vmagent \
-	package-vmalert \
-	package-vmauth \
-	package-vmbackup \
-	package-vmrestore
-
-vmutils: \
-	vmagent \
-	vmalert \
-	vmauth \
-	vmbackup \
-	vmrestore
+	package-vmstorage
 
 release: \
-	release-vmcluster \
-	release-vmutils
+	release-vmcluster
 
 release-vmcluster: \
 	vminsert-prod \
@@ -73,15 +47,6 @@ release-vmcluster: \
 	vmstorage-prod
 	cd bin && tar czf victoria-metrics-$(PKG_TAG).tar.gz vminsert-prod vmselect-prod vmstorage-prod && \
 		sha256sum victoria-metrics-$(PKG_TAG).tar.gz > victoria-metrics-$(PKG_TAG)_checksums.txt
-
-release-vmutils: \
-	vmagent-prod \
-	vmalert-prod \
-	vmauth-prod \
-	vmbackup-prod \
-	vmrestore-prod
-	cd bin && tar czf vmutils-$(PKG_TAG).tar.gz vmagent-prod vmalert-prod vmauth-prod vmbackup-prod vmrestore-prod && \
-		sha256sum vmutils-$(PKG_TAG).tar.gz > vmutils-$(PKG_TAG)_checksums.txt
 
 pprof-cpu:
 	go tool pprof -trim_path=github.com/VictoriaMetrics/VictoriaMetrics@ $(PPROF_FILE)
@@ -99,7 +64,7 @@ lint: install-golint
 	golint app/...
 
 install-golint:
-	which golint || GO111MODULE=off go get -u golang.org/x/lint/golint
+	which golint || go install golang.org/x/lint/golint
 
 errcheck: install-errcheck
 	errcheck -exclude=errcheck_excludes.txt ./lib/...
@@ -113,7 +78,7 @@ errcheck: install-errcheck
 	errcheck -exclude=errcheck_excludes.txt ./app/vmrestore/...
 
 install-errcheck:
-	which errcheck || GO111MODULE=off go get -u github.com/kisielk/errcheck
+	which errcheck || go install github.com/kisielk/errcheck
 
 check-all: fmt vet lint errcheck golangci-lint
 
@@ -159,14 +124,14 @@ quicktemplate-gen: install-qtc
 	qtc
 
 install-qtc:
-	which qtc || GO111MODULE=off go get -u github.com/valyala/quicktemplate/qtc
+	which qtc || go install github.com/valyala/quicktemplate/qtc
 
 
 golangci-lint: install-golangci-lint
 	golangci-lint run --exclude '(SA4003|SA1019|SA5011):' -D errcheck -D structcheck --timeout 2m
 
 install-golangci-lint:
-	which golangci-lint || GO111MODULE=off go get -u github.com/golangci/golangci-lint/cmd/golangci-lint
+	which golangci-lint || curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell go env GOPATH)/bin v1.29.0
 
 docs-sync:
 	cp app/vmagent/README.md docs/vmagent.md

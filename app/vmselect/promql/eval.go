@@ -4,13 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"runtime"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/searchutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -455,12 +455,10 @@ func evalRollupFunc(ec *EvalConfig, name string, rf rollupFunc, expr metricsql.E
 		ecNew = newEvalConfig(ecNew)
 		ecNew.Start -= offset
 		ecNew.End -= offset
-		if ecNew.MayCache {
-			start, end := AdjustStartEnd(ecNew.Start, ecNew.End, ecNew.Step)
-			offset += ecNew.Start - start
-			ecNew.Start = start
-			ecNew.End = end
-		}
+		// There is no need in calling AdjustStartEnd() on ecNew if ecNew.MayCache is set to true,
+		// since the time range alignment has been already performed by the caller,
+		// so cache hit rate should be quite good.
+		// See also https://github.com/VictoriaMetrics/VictoriaMetrics/issues/976
 	}
 	if name == "rollup_candlestick" {
 		// Automatically apply `offset -step` to `rollup_candlestick` function
@@ -573,7 +571,7 @@ func evalRollupFuncWithSubquery(ec *EvalConfig, name string, rf rollupFunc, expr
 }
 
 func doParallel(tss []*timeseries, f func(ts *timeseries, values []float64, timestamps []int64) ([]float64, []int64)) {
-	concurrency := runtime.GOMAXPROCS(-1)
+	concurrency := cgroup.AvailableCPUs()
 	if concurrency > len(tss) {
 		concurrency = len(tss)
 	}
@@ -697,7 +695,7 @@ func evalRollupFuncWithMetricExpr(ec *EvalConfig, name string, rf rollupFunc,
 	timeseriesLen := rssLen
 	if iafc != nil {
 		// Incremental aggregates require holding only GOMAXPROCS timeseries in memory.
-		timeseriesLen = runtime.GOMAXPROCS(-1)
+		timeseriesLen = cgroup.AvailableCPUs()
 		if iafc.ae.Modifier.Op != "" {
 			if iafc.ae.Limit > 0 {
 				// There is an explicit limit on the number of output time series.

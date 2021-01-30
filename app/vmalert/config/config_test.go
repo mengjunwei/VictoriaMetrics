@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"gopkg.in/yaml.v2"
+
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 )
 
 func TestMain(m *testing.M) {
@@ -42,7 +43,7 @@ func TestParseBad(t *testing.T) {
 		},
 		{
 			[]string{"testdata/dir/rules2-bad.rules"},
-			"function \"value\" not defined",
+			"function \"unknown\" not defined",
 		},
 		{
 			[]string{"testdata/dir/rules3-bad.rules"},
@@ -137,12 +138,14 @@ func TestGroup_Validate(t *testing.T) {
 						Alert: "alert",
 						Expr:  "up == 1",
 						Labels: map[string]string{
-							"summary": "{{ value|query }}",
+							"summary": `
+{{ with printf "node_memory_MemTotal{job='node',instance='%s'}" "localhost" | query }}
+  {{ . | first | value | humanize1024 }}B
+{{ end }}`,
 						},
 					},
 				},
 			},
-			expErr:              "error parsing annotation",
 			validateAnnotations: true,
 		},
 		{
@@ -323,34 +326,55 @@ func TestHashRule(t *testing.T) {
 }
 
 func TestGroupChecksum(t *testing.T) {
-	data := `
+	f := func(t *testing.T, data, newData string) {
+		t.Helper()
+		var g Group
+		if err := yaml.Unmarshal([]byte(data), &g); err != nil {
+			t.Fatalf("failed to unmarshal: %s", err)
+		}
+		if g.Checksum == "" {
+			t.Fatalf("expected to get non-empty checksum")
+		}
+
+		var ng Group
+		if err := yaml.Unmarshal([]byte(newData), &ng); err != nil {
+			t.Fatalf("failed to unmarshal: %s", err)
+		}
+		if g.Checksum == ng.Checksum {
+			t.Fatalf("expected to get different checksums")
+		}
+	}
+	t.Run("Ok", func(t *testing.T) {
+		f(t, `
 name: TestGroup
 rules:
   - alert: ExampleAlertAlwaysFiring
     expr: sum by(job) (up == 1)
   - record: handler:requests:rate5m
     expr: sum(rate(prometheus_http_requests_total[5m])) by (handler)
-`
-	var g Group
-	if err := yaml.Unmarshal([]byte(data), &g); err != nil {
-		t.Fatalf("failed to unmarshal: %s", err)
-	}
-	if g.Checksum == "" {
-		t.Fatalf("expected to get non-empty checksum")
-	}
-	newData := `
+`, `
 name: TestGroup
 rules:
   - record: handler:requests:rate5m
     expr: sum(rate(prometheus_http_requests_total[5m])) by (handler)
   - alert: ExampleAlertAlwaysFiring
     expr: sum by(job) (up == 1)
-`
-	var ng Group
-	if err := yaml.Unmarshal([]byte(newData), &g); err != nil {
-		t.Fatalf("failed to unmarshal: %s", err)
-	}
-	if g.Checksum == ng.Checksum {
-		t.Fatalf("expected to get different checksums")
-	}
+`)
+	})
+
+	t.Run("Ok, `for` must change cs", func(t *testing.T) {
+		f(t, `
+name: TestGroup
+rules:
+  - alert: ExampleAlertWithFor
+    expr: sum by(job) (up == 1)
+    for: 5m
+`, `
+name: TestGroup
+rules:
+  - alert: ExampleAlertWithFor
+    expr: sum by(job) (up == 1)
+`)
+	})
+
 }

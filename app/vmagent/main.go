@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,8 +20,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/vmimport"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	graphiteserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/graphite"
 	influxserver "github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver/influx"
@@ -48,7 +47,8 @@ var (
 		"Usually :4242 must be set. Doesn't work if empty")
 	opentsdbHTTPListenAddr = flag.String("opentsdbHTTPListenAddr", "", "TCP address to listen for OpentTSDB HTTP put requests. Usually :4242 must be set. Doesn't work if empty")
 	dryRun                 = flag.Bool("dryRun", false, "Whether to check only config files without running vmagent. The following files are checked: "+
-		"-promscrape.config, -remoteWrite.relabelConfig, -remoteWrite.urlRelabelConfig . See also -promscrape.config.dryRun")
+		"-promscrape.config, -remoteWrite.relabelConfig, -remoteWrite.urlRelabelConfig . "+
+		"Unknown config entries are allowed in -promscrape.config by default. This can be changed with -promscrape.config.strictParse")
 )
 
 var (
@@ -66,17 +66,20 @@ func main() {
 	remotewrite.InitSecretFlags()
 	buildinfo.Init()
 	logger.Init()
-	cgroup.UpdateGOMAXPROCSToCPUQuota()
 
-	if *dryRun {
-		if err := flag.Set("promscrape.config.strictParse", "true"); err != nil {
-			logger.Panicf("BUG: cannot set promscrape.config.strictParse=true: %s", err)
+	if promscrape.IsDryRun() {
+		if err := promscrape.CheckConfig(); err != nil {
+			logger.Fatalf("error when checking -promscrape.config: %s", err)
 		}
+		logger.Infof("-promscrape.config is ok; exitting with 0 status code")
+		return
+	}
+	if *dryRun {
 		if err := remotewrite.CheckRelabelConfigs(); err != nil {
 			logger.Fatalf("error when checking relabel configs: %s", err)
 		}
 		if err := promscrape.CheckConfig(); err != nil {
-			logger.Fatalf("error when checking Prometheus config: %s", err)
+			logger.Fatalf("error when checking -promscrape.config: %s", err)
 		}
 		logger.Infof("all the configs are ok; exitting with 0 status code")
 		return
@@ -140,7 +143,7 @@ func main() {
 }
 
 func requestHandler(w http.ResponseWriter, r *http.Request) bool {
-	if r.RequestURI == "/" {
+	if r.URL.Path == "/" {
 		fmt.Fprintf(w, "vmagent - see docs at https://victoriametrics.github.io/vmagent.html")
 		return true
 	}
@@ -208,9 +211,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	case "/targets":
 		promscrapeTargetsRequests.Inc()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		showOriginalLabels, _ := strconv.ParseBool(r.FormValue("show_original_labels"))
-		promscrape.WriteHumanReadableTargetsStatus(w, showOriginalLabels)
+		promscrape.WriteHumanReadableTargetsStatus(w, r)
 		return true
 	case "/api/v1/targets":
 		promscrapeAPIV1TargetsRequests.Inc()
@@ -268,10 +269,7 @@ func usage() {
 	const s = `
 vmagent collects metrics data via popular data ingestion protocols and routes it to VictoriaMetrics.
 
-See the docs at https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmagent/README.md .
+See the docs at https://victoriametrics.github.io/vmagent.html .
 `
-
-	f := flag.CommandLine.Output()
-	fmt.Fprintf(f, "%s\n", s)
-	flag.PrintDefaults()
+	flagutil.Usage(s)
 }
